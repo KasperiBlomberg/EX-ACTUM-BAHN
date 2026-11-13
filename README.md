@@ -2,7 +2,7 @@
 
 A dispatcher bot for the Spread challenge (see `llms.txt` and `docs/`). **Read `OPTIMIZATION_LOG.md` for everything that was tried and measured.**
 
-The bot is in **Python** (`spread_bot/`, Python 3.9+, no dependencies). It is a 1:1 port of the original JavaScript bot (`src/` → `spread-bot.mjs`), which is kept as a verified fallback and needs Node 22+.
+The bot is in **Python** (`spread_bot/`, Python 3.9+, no dependencies). It is a 1:1 port of the original JavaScript bot, verified to the cent against it on eight seeds; the JS is in git history up to commit `3112c0e`.
 
 ## Run
 
@@ -17,28 +17,22 @@ caffeinate -i python3 -m spread_bot --final                       # test final /
 python3 -m spread_bot --seed v-1 --starter                        # the kit starter's decisions, to check the desk
 ```
 
-The JS bot takes the same flags: `node spread-bot.mjs --level 8 --seed v-1` (edit `src/`, then `./build.sh`).
-
 **In the final**, the bot polls `/events`, answers each event straight away, and saves what it has learnt to `spread-state.json` every 2 seconds. After a crash, run the same command again: it rebuilds its orders from the server and reloads the state.
 
 ## Layout
 
-| Python | JS original | What |
-|---|---|---|
-| `spread_bot/api.py` | `src/core.js` | HTTP client: retries on 429 and server restarts |
-| `spread_bot/geo.py` | globals `P`, `ROAD`, `hav` | the map |
-| `spread_bot/desk.py` | `src/desk.js` | bookkeeping and event answers; `play_practice` |
-| `spread_bot/notes.py` | `src/notes.js` | dealer-note reader (fi/sv/en) |
-| `spread_bot/policy_v2.py` | `src/policy_v2.js` | Bayesian competitor model, v2 policy |
-| `spread_bot/policy_v4.py` | `src/policy_v4.js` | **the policy the bot plays** |
-| `spread_bot/__main__.py` | `src/main.js` | CLI, sweeps, the final loop |
-| `tests/test_notes.py` | `tests/notes.test.mjs` | 43 note cases: `python3 tests/test_notes.py` |
+| File | What |
+|---|---|
+| `spread_bot/api.py` | HTTP client: retries on 429 and server restarts |
+| `spread_bot/geo.py` | the map: places, roads, straight-line distance |
+| `spread_bot/desk.py` | bookkeeping and event answers; `play_practice` |
+| `spread_bot/notes.py` | dealer-note reader (fi/sv/en) |
+| `spread_bot/policy_v2.py` | Bayesian competitor model, v2 policy |
+| `spread_bot/policy_v4.py` | **the policy the bot plays** |
+| `spread_bot/__main__.py` | CLI, sweeps, the final loop |
+| `tests/test_notes.py` | 43 note cases: `python3 tests/test_notes.py` |
 
-`docs/` holds the challenge handbook, rules, API reference and the official Python kit. `tools/` holds the JS browser harness used to simulate a final clock, and the direct-offer policy that didn't pay off.
-
-## Port verification
-
-See "Port" in `OPTIMIZATION_LOG.md` for the side-by-side runs of the JS and Python bots on the same seeds.
+`docs/` holds the challenge handbook, rules, API reference and the official Python kit. The OPTIMIZATION_LOG mentions `src/*.js` and `tools/` in places: those are the JS files the Python modules were ported from, same names.
 
 ## Default (setting set F) on level 8 seeds v-1…v-8
 Average **+€11.2k per week**. Worst on-time share 95.3%, and all eight weeks ranked. The starter loses €72.6k on spread-1.
