@@ -182,7 +182,23 @@ Tests: `node tests/notes.test.mjs` (43 cases, all passing).
 7. **Use the forecast event** (snow; summer tyres in snow can't be collected).
 8. **Ranking runs:** five per level per round, and they count even if deleted. Play them only with the validated default.
 
-## 8. Settings reference (`makeV4` defaults = F)
+## 8. The Python port (Friday 13 Nov, 22:30–23:30)
+
+The bot was ported 1:1 to Python (`spread_bot/`, 3.9+, no dependencies) so the team can read and change it; the JS bot stays as a verified fallback. Module for module, same names, same constants, no changes to the logic during the port. Both bots take a `--starter` flag that plays the kit starter's decisions (no policy), to check the desk on its own.
+
+Verification on level 8, same seeds, both bots:
+
+| Run | JS | Python |
+|---|---|---|
+| v-1 `--starter` | −€79,963.93, 949 orders, 48.2% on time | −€79,963.93, 949 orders, 48.2% on time |
+| v-1 (v4 = F) | €10,557.42, 355 orders, 96.3% on time | €10,557.42, 355 orders, 96.3% on time |
+| v-2…v-8 (v4 = F) | the F table above (to the euro) | the F table above (to the euro) |
+
+Identical to the cent, the Bayesian model's floating-point included. Note tests: `python3 tests/test_notes.py`, 43/43, the same cases as the JS suite.
+
+Porting notes: Python's `re` has no `\p{L}`, so `notes.py` builds the letter class and the ASCII `\w`/`\b` by hand to match the JS regexes exactly; JS `Math.round` is `floor(x + 0.5)`; the markup grid is accumulated in 0.02 steps as in JS, not computed, so the floats match; the API client keeps one connection per thread (urllib would open a new TLS connection per request, several times slower).
+
+## 9. Settings reference (`makeV4` defaults = F)
 
 `maxKm 450`, `minSlack 360`, `minSlackPriv 600`, `f0 0.92`, `f0Risk 0.30`, `f1 1.25 @ lastPickup−420`, `f2 1.5 @ lastPickup−270`, `failRef 1.0`, `failPrice 0.15`, `targetLate 0.06`, `shadowK 25`, `earlyFail 240`, `backlogB 10`, `warnW 0.4`, `pendW 0.15`, `hardLate 0.075`, `hardPFail 0.15`, `riskSlack [[480,.20],[720,.07],[∞,.02]]`, `riskKm [[200,0],[300,.04],[∞,.14]]`, `optRiskGap 0.08`, competitor model `k 11`, `war 0.15`, `daySd 0.12`, level grid 1.05–1.95, day grid −0.40…+0.35, `temper 0.8`.
 

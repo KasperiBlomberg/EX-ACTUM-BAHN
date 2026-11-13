@@ -24,6 +24,7 @@ function report(label, s) {
 }
 
 const params = JSON.parse(opt('params', '{}'));
+const makePolicy = () => flag('starter') ? {} : makeV4(params);   // --starter: the kit starter's decisions, to check the desk
 
 // several seeds in parallel (max 8 practice slots): --seeds v-1,v-2,... prints one line per seed and the total
 async function sweepSeeds(seeds, level) {
@@ -34,7 +35,7 @@ async function sweepSeeds(seeds, level) {
       const seed = seeds[i++];
       const w = await api.create(level, seed);
       try {
-        const { score, desk } = await playPractice(api, w.worldId, level, makeV4(params));
+        const { score, desk } = await playPractice(api, w.worldId, level, makePolicy());
         out.push({ seed, score, stats: desk.policy.stats });
         console.log(`${seed.padEnd(8)} margin €${(score.marginCents / 100).toFixed(0).padStart(7)}  ${String(score.wonOrders).padStart(4)} orders  ${(100 * score.onTimeShare).toFixed(1)}% on time`);
       } catch (e) { console.error(seed, String(e)); try { await api.del(w.worldId); } catch { } }
@@ -53,7 +54,7 @@ async function practice() {
   const stop = async () => { if (!flag('board')) { try { await api.del(w.worldId); } catch { } } process.exit(1); };
   process.on('SIGINT', stop);
   try {
-    const { score } = await playPractice(api, w.worldId, level, makeV4(params));
+    const { score } = await playPractice(api, w.worldId, level, makePolicy());
     report('End', score);
     console.log(score.ranked ? 'Ranked.' : 'Not ranked.');
   } catch (e) { console.error(e); await stop(); }
