@@ -23,6 +23,7 @@ caffeinate -i node spread-bot.mjs --final                     # test final / fin
 Average **+€11.2k per week**. Worst on-time share 95.3%, and all eight weeks ranked. The starter loses €72.6k on spread-1.
 
 ## How it decides (short version)
+
 1. **Which cars to take.** Distance and slack are hard limits (450 km, 6 hours). Slack comes from the deadline, the dealer's note, the site hours and the drive time.
 2. **Risk of no driver.** Per pickup town, learnt live, with a prior from the roster. The bot's own unbooked backlog in the town adds to it, as do structural risks from short slack and long distance.
 3. **The price.** A Bayesian competitor model per world and per day, with a price-war prior and dealer trust. The bot quotes the price that maximises P(win) × (price − fee − risk cost × lateness shadow price). Slower options are offered only when the fast option is much riskier.
