@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the Spread bot decides</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  /* Layout: one reading column, figures full width of the column; a dispatcher's desk, cool neutrals, one blue accent. */
+  --bg: #f6f7f9; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --line: #e1e0d9; --axis: #c3c2b7; --accent: #2a78d6; --accent-soft: #cde2fb;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+  --font-display: "IBM Plex Sans Condensed", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --line: #2c2c2a; --axis: #383835; --accent: #3987e5; --accent-soft: #184f95;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --line: #2c2c2a; --axis: #383835; --accent: #3987e5; --accent-soft: #184f95;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.55 var(--font-body); padding: 0 16px 64px; }
+main { max-width: 760px; margin: 0 auto; }
+header { padding: 48px 0 8px; }
+.eyebrow { font: 500 13px/1 var(--font-mono); color: var(--accent); letter-spacing: .04em; text-transform: uppercase; }
+h1 { font: 600 40px/1.1 var(--font-display); margin: 10px 0 12px; text-wrap: balance; }
+h2 { font: 600 26px/1.2 var(--font-display); margin: 48px 0 12px; text-wrap: balance; }
+h3 { font: 600 18px/1.3 var(--font-body); margin: 28px 0 8px; }
+p, li { max-width: 65ch; color: var(--ink); }
+.lead { font-size: 18px; color: var(--ink-2); }
+a { color: var(--accent); }
+code, .mono { font-family: var(--font-mono); font-size: .92em; }
+code { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.formula { font-family: var(--font-mono); font-size: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; margin: 12px 0; color: var(--ink); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 8px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.tile .label { font-size: 13px; color: var(--ink-2); }
+.tile .value { font: 600 28px/1.15 var(--font-body); margin-top: 4px; }
+.tile .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+figure { margin: 20px 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+figure svg { max-width: 100%; height: auto; display: block; }
+figcaption { font-size: 13.5px; color: var(--ink-2); margin-top: 10px; max-width: none; }
+.controls { display: flex; flex-wrap: wrap; gap: 14px 24px; margin: 0 0 12px; }
+.controls label { display: grid; gap: 4px; font-size: 13px; color: var(--ink-2); min-width: 160px; }
+.controls output { font: 500 14px var(--font-mono); color: var(--ink); }
+input[type=range] { accent-color: var(--accent); width: 100%; }
+input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 560px) { .pair { grid-template-columns: 1fr; } h1 { font-size: 32px; } }
+.readout { font: 500 14px/1.5 var(--font-mono); color: var(--ink); padding: 8px 0 0; border-top: 1px solid var(--line); margin-top: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; margin: 12px 0; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--ink-2); font-size: 13px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.us td { font-weight: 600; }
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 16px 0; }
+.steps li { counter-increment: s; position: relative; padding: 0 0 18px 44px; max-width: none; }
+.steps li::before { content: counter(s); position: absolute; left: 0; top: 2px; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; font: 600 14px/28px var(--font-mono); text-align: center; }
+.steps li strong { display: block; margin-bottom: 2px; }
+.steps li p { margin: 0; color: var(--ink-2); max-width: 62ch; }
+.ideas { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.idea { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; }
+.idea h3 { margin: 0; font-size: 16.5px; }
+.idea p { margin: 4px 0 0; color: var(--ink-2); font-size: 14.5px; grid-column: 1 / -1; max-width: none; }
+.chips { display: flex; gap: 6px; align-self: start; }
+.chip { font: 500 12px/1 var(--font-mono); padding: 5px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-2); white-space: nowrap; }
+.chip.hi { border-color: var(--accent); color: var(--accent); }
+.note { border-left: 3px solid var(--accent); padding: 6px 14px; color: var(--ink-2); margin: 16px 0; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--ink-2); margin: 0 0 8px; }
+.legend span::before { content: ""; display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; background: var(--k); }
+.sr { position: absolute; left: -9999px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div class="eyebrow">Spread · Junction 2026 · team EX-ACTUM</div>
+  <h1>How the Spread bot decides</h1>
+  <p class="lead">What the bot does with every price request, why it refuses so many, how it learns during the week, where it loses to the leaders, and what we could change before Sunday's final.</p>
+</header>
+
+<section>
+  <h2>Where we stand</h2>
+  <p>Ranking round 3, world 1 of 5, level 8, Friday evening. Thirteen teams have played that world so far.</p>
+  <div class="tiles">
+    <div class="tile"><div class="label">Our margin, world 1</div><div class="value">€8,853</div><div class="sub">3rd of 13 teams · ranked</div></div>
+    <div class="tile"><div class="label">On time</div><div class="value">97.5%</div><div class="sub">the minimum is 90%</div></div>
+    <div class="tile"><div class="label">Orders won</div><div class="value">278</div><div class="sub">Juhus 339 · House best 465</div></div>
+    <div class="tile"><div class="label">Margin per order</div><div class="value">€32</div><div class="sub">Juhus €45 · House best €35</div></div>
+  </div>
+  <p>The leaders are not safer than us; they are busier. Juhus wins 22% more cars and earns €13 more on each one at the same on-time share. House best wins 67% more cars at a slightly lower margin each and runs much closer to the 90% line. Our bot is the cautious one.</p>
+</section>
+
+<section>
+  <h2>The job in one paragraph</h2>
+  <p>Every few minutes a dealer asks for a price to move a car. We have 15 minutes to answer. If we win, we must find a freelance driver through the drivers' app by posting a gig with a fee, and the car must arrive by its deadline. A late car refunds part of the price and counts against the 90% on-time minimum that decides whether we are ranked at all. Score is gross margin: prices in, fees and refunds out. So each request is one question: <em>is this car worth winning, and at what price, given how likely it is that a driver takes it in time?</em></p>
+</section>
+
+<section>
+  <h2>The pipeline for one request</h2>
+  <figure>
+    <svg viewBox="0 0 760 330" role="img" aria-label="A price request flows through the note reader, hard filters, the risk estimate and the pricing model to a quote or a decline; a won order gets a fee schedule; outcomes feed back into the competitor model, the town risk and dealer trust.">
+      <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+      <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12" fill="currentColor" stroke="currentColor">
+        <!-- row 1: the decision -->
+        <rect x="10" y="40" width="110" height="52" rx="6" fill="none" stroke-width="1.2"/><text x="65" y="62" text-anchor="middle" stroke="none" font-weight="600">Price request</text><text x="65" y="78" text-anchor="middle" stroke="none" font-size="11" opacity=".75">cars, options, note</text>
+        <rect x="150" y="40" width="110" height="52" rx="6" fill="none" stroke-width="1.2"/><text x="205" y="62" text-anchor="middle" stroke="none" font-weight="600">Note reader</text><text x="205" y="78" text-anchor="middle" stroke="none" font-size="11" opacity=".75">ready, hours, deadline</text>
+        <rect x="290" y="40" width="110" height="52" rx="6" fill="none" stroke-width="1.2"/><text x="345" y="62" text-anchor="middle" stroke="none" font-weight="600">Hard filters</text><text x="345" y="78" text-anchor="middle" stroke="none" font-size="11" opacity=".75">≤ 450 km, slack ≥ 6 h</text>
+        <rect x="430" y="40" width="110" height="52" rx="6" fill="none" stroke-width="1.2"/><text x="485" y="62" text-anchor="middle" stroke="none" font-weight="600">Risk of no driver</text><text x="485" y="78" text-anchor="middle" stroke="none" font-size="11" opacity=".75">town + slack + distance</text>
+        <rect x="570" y="40" width="110" height="52" rx="6" fill="none" stroke="#2a78d6" stroke-width="2"/><text x="625" y="62" text-anchor="middle" stroke="none" font-weight="600">Pick the price</text><text x="625" y="78" text-anchor="middle" stroke="none" font-size="11" opacity=".75">max P(win) × margin</text>
+        <line x1="120" y1="66" x2="148" y2="66" stroke-width="1.2" marker-end="url(#arr)"/>
+        <line x1="260" y1="66" x2="288" y2="66" stroke-width="1.2" marker-end="url(#arr)"/>
+        <line x1="400" y1="66" x2="428" y2="66" stroke-width="1.2" marker-end="url(#arr)"/>
+        <line x1="540" y1="66" x2="568" y2="66" stroke-width="1.2" marker-end="url(#arr)"/>
+        <!-- decline branch -->
+        <line x1="345" y1="92" x2="345" y2="128" stroke-width="1.2" marker-end="url(#arr)"/>
+        <text x="352" y="114" stroke="none" font-size="11" opacity=".75">fails</text>
+        <rect x="290" y="130" width="110" height="36" rx="6" fill="none" stroke-width="1.2" stroke-dasharray="4 3"/><text x="345" y="153" text-anchor="middle" stroke="none">Decline: quote 5× list</text>
+        <line x1="625" y1="92" x2="625" y2="128" stroke-width="1.2" marker-end="url(#arr)"/>
+        <text x="632" y="114" stroke="none" font-size="11" opacity=".75">EV ≤ 0 or brake</text>
+        <rect x="570" y="130" width="110" height="36" rx="6" fill="none" stroke-width="1.2" stroke-dasharray="4 3"/><text x="625" y="153" text-anchor="middle" stroke="none">Decline</text>
+        <!-- quote -> dealer -> won -->
+        <line x1="680" y1="66" x2="730" y2="66" stroke-width="1.2"/><line x1="730" y1="66" x2="730" y2="210" stroke-width="1.2"/><line x1="730" y1="210" x2="682" y2="210" stroke-width="1.2" marker-end="url(#arr)"/>
+        <text x="738" y="140" stroke="none" font-size="11" opacity=".75" transform="rotate(90 738 140)">quote · dealer decides at +15 min</text>
+        <!-- row 2: after the win -->
+        <rect x="570" y="188" width="110" height="44" rx="6" fill="none" stroke-width="1.2"/><text x="625" y="207" text-anchor="middle" stroke="none" font-weight="600">Order won</text><text x="625" y="222" text-anchor="middle" stroke="none" font-size="11" opacity=".75">or lost</text>
+        <rect x="430" y="188" width="110" height="44" rx="6" fill="none" stroke-width="1.2"/><text x="485" y="207" text-anchor="middle" stroke="none" font-weight="600">Post a gig</text><text x="485" y="222" text-anchor="middle" stroke="none" font-size="11" opacity=".75">windows from the note</text>
+        <rect x="290" y="188" width="110" height="44" rx="6" fill="none" stroke-width="1.2"/><text x="345" y="207" text-anchor="middle" stroke="none" font-weight="600">Fee schedule</text><text x="345" y="222" text-anchor="middle" stroke="none" font-size="11" opacity=".75">0.92→1.25→1.5× typical</text>
+        <rect x="150" y="188" width="110" height="44" rx="6" fill="none" stroke-width="1.2"/><text x="205" y="207" text-anchor="middle" stroke="none" font-weight="600">Driver books</text><text x="205" y="222" text-anchor="middle" stroke="none" font-size="11" opacity=".75">or drops, or nobody</text>
+        <rect x="10" y="188" width="110" height="44" rx="6" fill="none" stroke-width="1.2"/><text x="65" y="207" text-anchor="middle" stroke="none" font-weight="600">Delivered</text><text x="65" y="222" text-anchor="middle" stroke="none" font-size="11" opacity=".75">on time or late</text>
+        <line x1="568" y1="210" x2="542" y2="210" stroke-width="1.2" marker-end="url(#arr)"/>
+        <line x1="428" y1="210" x2="402" y2="210" stroke-width="1.2" marker-end="url(#arr)"/>
+        <line x1="288" y1="210" x2="262" y2="210" stroke-width="1.2" marker-end="url(#arr)"/>
+        <line x1="148" y1="210" x2="122" y2="210" stroke-width="1.2" marker-end="url(#arr)"/>
+        <!-- learning loops -->
+        <path d="M625,232 L625,290 L625,290" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+        <path d="M625,290 L625,300" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+        <path d="M205,232 L205,268" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+        <path d="M65,232 L65,300" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+        <rect x="560" y="300" width="130" height="24" rx="12" fill="#2a78d6" stroke="none"/><text x="625" y="316" text-anchor="middle" stroke="none" fill="#fff" font-size="11" font-weight="600">competitor model</text>
+        <rect x="140" y="268" width="130" height="24" rx="12" fill="#2a78d6" stroke="none"/><text x="205" y="284" text-anchor="middle" stroke="none" fill="#fff" font-size="11" font-weight="600">town risk ok / fail</text>
+        <rect x="0" y="300" width="130" height="24" rx="12" fill="#2a78d6" stroke="none"/><text x="65" y="316" text-anchor="middle" stroke="none" fill="#fff" font-size="11" font-weight="600">trust · late share</text>
+        <text x="380" y="316" text-anchor="middle" stroke="none" font-size="11" fill="#2a78d6">these three feed back into the next quote</text>
+      </g>
+    </svg>
+    <figcaption>Top row: the quote decision, under 15 minutes. Bottom row: what happens after a win. Blue pills: the three things the bot learns during the week, all of which change later quotes.</figcaption>
+  </figure>
+
+  <ol class="steps">
+    <li><strong>Read the note.</strong><p>Dealers write notes in Finnish, Swedish or English: "valmis huomenna klo 10", "nouto ennen 16", "manual gearbox", "no plates". A rule-based reader turns these into a ready time, pickup and delivery hours, a tighter deadline, and flags. It gets about 95% of them right (measured against the reveal). The world obeys the note whether or not we read it, so a missed note means a failed visit we pay for.</p></li>
+    <li><strong>Apply the hard filters.</strong><p>Decline outright if the drive is over 450 km, if the slack is under 6 hours (10 hours for private addresses), or if it is a trade-in with a private address. Slack is the time between when the car can be collected and the last minute a pickup still makes the deadline, after subtracting the drive. Declining means quoting five times the list price, which costs nothing (an unanswered request costs goodwill).</p></li>
+    <li><strong>Estimate the risk that no driver takes the car.</strong><p>Three parts, combined as independent risks. The <em>town</em> part is a running success rate per pickup town, started from a prior based on how many drivers live within 30 km, and made worse by our own unbooked cars waiting in that town. The <em>structural</em> part adds risk for short slack (under 8 h: +20%; under 12 h: +7%) and long drives (over 300 km: +14%; over 200 km: +4%).</p></li>
+    <li><strong>Pick the price.</strong><p>For every markup from 1.00× to 2.30× the list price, in steps of 0.02, compute P(win) from the competitor model and the expected margin if won, and quote the markup with the best product. If the best expected value is zero or negative, decline. If our projected late share is already above 7.5% and this car is risky, decline too (the "brake"). All options we accept get the same markup; slower options are offered only when the fast one is much riskier.</p></li>
+    <li><strong>Post the gig and raise the fee on a schedule.</strong><p>Open at 0.92× the typical fee plus 0.30× the risk; step to 1.25× seven hours before the last safe pickup and 1.5× at 4.5 hours. After a drop or a no-show, raise at once. From the server's three-hour warning, go steep: 1.5× rising to 2.5× in half-hour steps.</p></li>
+    <li><strong>Learn.</strong><p>Each win or loss updates the competitor model. A booking before the warning marks the town "ok"; a warning, or four daytime hours unbooked, marks it "fail". Each on-time delivery raises that dealer's trust (they accept 1% more per order, up to 25%); a late one halves it. The running late share scales a penalty on risky cars.</p></li>
+  </ol>
+</section>
+
+<section>
+  <h2>The pricing model, interactively</h2>
+  <p>The competitor is a hidden price per request: the list price times a world level (26% to 54% above list at level 8), a daily factor, and a lane factor. We never see it. We see only whether each quote won or lost, so the bot keeps a probability distribution over the world level and today's factor on a 37×31 grid and updates it after every result (a Bayesian grid posterior). The chance of winning at a given markup is a logistic curve centred on the competitor's price, with slope <span class="mono">k = 11</span>.</p>
+  <p>Drag the sliders. The left chart is what the bot believes about winning; the right chart is the margin it expects, and the dot is the price it quotes.</p>
+  <figure>
+    <div class="controls">
+      <label>Competitor's price, × list <input id="cL" type="range" min="1.10" max="1.90" step="0.01" value="1.40"><output id="oL">1.40×</output></label>
+      <label>Risk of no driver (pFail) <input id="cPf" type="range" min="0" max="0.60" step="0.01" value="0.15"><output id="oPf">15%</output></label>
+      <label>Lateness shadow price λ <input id="cLam" type="range" min="1" max="6" step="0.1" value="1.0"><output id="oLam">1.0</output></label>
+    </div>
+    <div class="pair">
+      <div><svg id="pwin" viewBox="0 0 360 230" role="img" aria-label="Probability of winning the request against the markup over list price."></svg></div>
+      <div><svg id="ev" viewBox="0 0 360 230" role="img" aria-label="Expected margin per request against the markup; the dot marks the quoted markup."></svg></div>
+    </div>
+    <div class="readout" id="readout"></div>
+    <figcaption>A simplified single-point competitor for illustration; the real model averages over its whole posterior, so its curve is smoother and wider early in the week. Typical fee €76, list price €82 (1.08× the fee, as measured). Cost = (0.92 + 0.30·pFail)·fee + pFail·λ·(fee + 0.15·price).</figcaption>
+  </figure>
+  <div class="formula">EV(u) = P(win | u) × ( u·list − f₀·fee − pFail·λ·(fee + 0.15·u·list) )<br>f₀ = 0.92 + 0.30·pFail &nbsp;&nbsp; λ = 1 + 250·max(0, lateShare − 0.06) &nbsp;&nbsp; quote = argmax over u ∈ {1.00, 1.02, …, 2.30}</div>
+  <p>Two things this shows. First, the quoted markup sits well <em>below</em> the competitor's price, because a 90% chance of a good margin beats a 50% chance of a slightly better one. Second, risk does not lower the price much; it mostly lowers the expected value until it crosses zero and the car is declined. That is why our order count is low: the decline is the bot's main risk control.</p>
+</section>
+
+<section>
+  <h2>The fee schedule for one car</h2>
+  <figure>
+    <div class="legend"><span style="--k: var(--s1)">Our schedule (risk 20%)</span><span style="--k: var(--s2)">Kit starter, posted 24 h before</span></div>
+    <svg id="fees" viewBox="0 0 720 240" role="img" aria-label="Fee as a multiple of the typical fee over the hours before the last safe pickup, stepping from 0.98 to 1.25, 1.5, then 1.5 to 2.5 after the three-hour warning."></svg>
+    <figcaption>Hours before <code>lastPickupAt</code>, the last minute a pickup still makes the deadline. The server's <code>deadline_close</code> warning comes at 3 hours; from then on every step costs more than the previous one and most of the money is already lost: a late car refunds 10–50% of its price. The kit starter raises blindly from the moment it posts.</figcaption>
+  </figure>
+  <p>The log found that 93% of the cars we take are booked at the opening fee, and that paying more barely helps the rest: the cars that never book are limited by where drivers live and by timing, not by price. So the fee is not where the money is. Selection and price are.</p>
+</section>
+
+<section>
+  <h2>Where the leaders beat us</h2>
+  <p>The same world, the same requests. Orders won and margin per order, world 1 of round 3.</p>
+  <figure>
+    <div class="pair">
+      <div><svg id="orders" viewBox="0 0 360 200" role="img" aria-label="Orders won on world 1: House best 465, Juhus 339, EX-ACTUM 278, Bob the builders 197, Team Alpha 156."></svg></div>
+      <div><svg id="perorder" viewBox="0 0 360 200" role="img" aria-label="Margin per order on world 1: Juhus 45 euros, House best 35, EX-ACTUM 32, Bob the builders 43, Team Alpha 35."></svg></div>
+    </div>
+    <figcaption>Juhus wins more cars than us <em>and</em> earns more on each. House best takes many more cars at a thinner margin and 93% on time. We are third on both counts with the highest on-time share of the three: the cautious setting.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Team</th><th class="num">Margin</th><th class="num">Orders</th><th class="num">€ / order</th><th class="num">On time</th></tr></thead>
+    <tbody>
+      <tr><td>House best (organisers)</td><td class="num">€16,371</td><td class="num">465</td><td class="num">€35</td><td class="num">93.3%</td></tr>
+      <tr><td>Juhus</td><td class="num">€15,361</td><td class="num">339</td><td class="num">€45</td><td class="num">97.6%</td></tr>
+      <tr class="us"><td>EX-ACTUM (us)</td><td class="num">€8,853</td><td class="num">278</td><td class="num">€32</td><td class="num">97.5%</td></tr>
+      <tr><td>Bob the builders</td><td class="num">€8,443</td><td class="num">197</td><td class="num">€43</td><td class="num">93.9%</td></tr>
+      <tr><td>Team Alpha</td><td class="num">€5,442</td><td class="num">156</td><td class="num">€35</td><td class="num">95.5%</td></tr>
+    </tbody>
+  </table>
+  <p>Across all five worlds of the round, Juhus averages €14k a week and House best €12k; our eight practice seeds average €11.2k. The final picks the top 10 ranked teams by margin; only 8 of the 11 teams that finished the round are ranked at all, so being ranked is already most of the battle. But the jury then judges the top 10 on approach, so the margin and the story both matter.</p>
+</section>
+
+<section>
+  <h2>What we could change</h2>
+  <p>Ordered by how much margin each idea could plausibly add against how risky it is to build in a day. The first two are where the leaders' advantage most likely comes from.</p>
+  <ul class="ideas">
+    <li class="idea"><h3>1. Bundle cars into one gig</h3><div class="chips"><span class="chip hi">impact high</span><span class="chip">effort high</span></div><p>The bot posts every car as its own gig. The rules allow one driver to take several cars in one gig, up to 12 hours of driving, and a driver's cost is dominated by getting to the pickup and home again, not by the drive itself. A return leg, a second car from the same yard, or two cars heading the same way cost a driver little extra. Bundled gigs book at lower fees and in towns where single cars don't book at all. This also handles the weekly bulk order (30–40 cars from one yard) that a one-gig-per-car bot cannot. The handbook calls this "chains of gigs" and says it is how a dispatcher wins.</p></li>
+    <li class="idea"><h3>2. Win more cars: relax the filters where the risk model says it's safe</h3><div class="chips"><span class="chip hi">impact high</span><span class="chip">effort low</span></div><p>We decline about half of all requests up front. The hard limits (450 km, 6 h slack) predate the structural risk model, which now prices the same things. Setting G (550 km, backlog 12) already made +€400 a week with less buffer. A sweep on unseen seeds v-9 to v-16 over <code>maxKm</code>, <code>minSlack</code> and <code>targetLate</code> is cheap and runs unattended. The constraint is the worst-seed on-time share, not the average.</p></li>
+    <li class="idea"><h3>3. Price each delivery option separately</h3><div class="chips"><span class="chip">impact medium</span><span class="chip">effort medium</span></div><p>Dealers take same-day 84% of the time when both options cost the same, so same-day is worth more to them. Charging it more and next-day less steers the risky, tight-slack cars toward the option with more slack while earning more on the rest. Needs the competitor update to use the chosen option's price.</p></li>
+    <li class="idea"><h3>4. A per-dealer offset in the competitor model</h3><div class="chips"><span class="chip">impact medium</span><span class="chip">effort medium</span></div><p>Every morning the competitor lowers its prices for dealers where we won most and raises them where we won few. Our model has one world level and one day factor and so is slow to notice. A small per-dealer correction, learned from that dealer's wins and losses, follows it.</p></li>
+    <li class="idea"><h3>5. Direct offers at the right fee, not the current one</h3><div class="chips"><span class="chip">impact medium</span><span class="chip">effort medium</span></div><p>The earlier attempt sent offers to drivers finishing nearby at the fee already in the app, and 3 of 1,274 were accepted. The handbook says offers pay off on gigs whose fee drivers expect to rise: offer a fee above the app's, to the driver who is already in that town, before the warning.</p></li>
+    <li class="idea"><h3>6. Use the snow forecast</h3><div class="chips"><span class="chip">impact low</span><span class="chip">effort low</span></div><p>A <code>forecast</code> event announces snow. Drivers there drop bookings and summer-tyre cars cannot be collected. Raising the risk for those towns and hours for that day is a few lines.</p></li>
+  </ul>
+  <div class="note">What <em>not</em> to spend time on: the fee schedule (most cars book at the opening fee), and the note reader (already 95%; remaining misses are rare phrasings). A better reader is worth maybe a handful of failed visits a week.</div>
+</section>
+
+<section>
+  <h2>The €200 of Verda compute</h2>
+  <p>Honest assessment: the bottleneck is not computation. The server allows eight practice worlds at a time and rate-limits requests, so a sweep is bound by the server, not by our machine. There is no local simulator to train a model against, and the rule-based parts (notes, pricing) are not where the margin is. A GPU would sit idle. Three uses do make sense:</p>
+  <ol>
+    <li><strong>A machine that runs the final.</strong> The final is 34 real minutes on Sunday morning with a moving clock; a request has 4.5 real seconds. A cloud VM with a wired connection, running <code>python -m spread_bot --final</code> under <code>nohup</code>, does not sleep, lose wifi or get closed by accident. Rehearse it in Saturday's test finals (14:00 and 20:00 Helsinki). Keep a laptop ready as the second runner; two systems on one key share the request budget and take turns.</li>
+    <li><strong>Unattended overnight sweeps.</strong> Validate F and G and the relaxed filters of idea 2 on v-9…v-24 while we sleep, eight worlds at a time, and write the results to a file. CPU only.</li>
+    <li><strong>An LLM pass over the reveal notes, offline.</strong> Pull the notes from our played worlds, let a model label the ones the rule reader got wrong, and add them to the test cases. Small, optional, and never in the live loop: the rule reader answers in microseconds and the final allows seconds.</li>
+  </ol>
+  <p>Do not plan around the credits; plan around the server's eight slots and Sunday's clock.</p>
+</section>
+
+<section>
+  <h2>Plan to Sunday</h2>
+  <table>
+    <thead><tr><th>When</th><th>What</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Tonight</td><td>Finish ranking round 3 (four more runs, ~20 min). Start the v-9…v-16 validation of F and G.</td><td>A five-world total against the field, and unseen-seed numbers to pick a default from.</td></tr>
+      <tr><td>Saturday morning</td><td>Build idea 2 (filter sweep) and start idea 1 (bundling) behind a flag; compare on the same seeds.</td><td>The two biggest levers; the flag keeps F as the safe fallback.</td></tr>
+      <tr><td>Saturday 14:00 and 20:00</td><td>Test finals with <code>--final</code>, from the cloud VM and a laptop.</td><td>The final loop has never run against a live clock.</td></tr>
+      <tr><td>Saturday evening</td><td>Freeze the default. Play a ranking round with it if a new round is open.</td><td>No untested change goes into the final.</td></tr>
+      <tr><td>Sunday 07:30</td><td>Start <code>--final</code> on both machines; it waits for 08:00.</td><td>The final runs with or without us.</td></tr>
+    </tbody>
+  </table>
+</section>
+</main>
+
+<script>
+(function () {
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs, parent) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (parent) parent.appendChild(n); return n; };
+  const txt = (parent, x, y, s, attrs) => { const t = el('text', Object.assign({ x, y, 'font-size': 11, fill: css('--muted'), 'font-family': 'IBM Plex Sans, system-ui, sans-serif' }, attrs || {}), parent); t.textContent = s; return t; };
+
+  function axes(svg, W, H, pad, xTicks, yTicks, xfmt, yfmt, xlabel, ylabel) {
+    svg.innerHTML = '';
+    const sx = (x) => pad.l + (x - xTicks[0]) / (xTicks[xTicks.length - 1] - xTicks[0]) * (W - pad.l - pad.r);
+    const sy = (y) => H - pad.b - (y - yTicks[0]) / (yTicks[yTicks.length - 1] - yTicks[0]) * (H - pad.t - pad.b);
+    for (const y of yTicks) { el('line', { x1: pad.l, x2: W - pad.r, y1: sy(y), y2: sy(y), stroke: css('--line'), 'stroke-width': 1 }, svg); txt(svg, pad.l - 6, sy(y) + 4, yfmt(y), { 'text-anchor': 'end' }); }
+    el('line', { x1: pad.l, x2: W - pad.r, y1: sy(yTicks[0]), y2: sy(yTicks[0]), stroke: css('--axis'), 'stroke-width': 1 }, svg);
+    for (const x of xTicks) txt(svg, sx(x), H - pad.b + 16, xfmt(x), { 'text-anchor': 'middle' });
+    if (xlabel) txt(svg, (pad.l + W - pad.r) / 2, H - 4, xlabel, { 'text-anchor': 'middle', fill: css('--ink-2') });
+    if (ylabel) txt(svg, 10, pad.t - 8, ylabel, { fill: css('--ink-2') });
+    return { sx, sy };
+  }
+  function polyline(svg, pts, color) { el('polyline', { points: pts.map(p => p.join(',')).join(' '), fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg); }
+
+  // ---------- pricing, interactive
+  const FEE = 76, LIST = 82, K = 11;
+  const grid = []; for (let u = 1.0; u <= 2.3 + 1e-9; u += 0.02) grid.push(Math.round(u * 100) / 100);
+  const sig = (x) => 1 / (1 + Math.exp(-x));
+  function drawPricing() {
+    const L = +cL.value, pf = +cPf.value, lam = +cLam.value;
+    oL.value = L.toFixed(2) + '×'; oPf.value = Math.round(pf * 100) + '%'; oLam.value = lam.toFixed(1);
+    const f0 = 0.92 + 0.30 * pf;
+    const pw = grid.map(u => sig(K * (Math.log(L) - Math.log(u))));
+    const ev = grid.map((u, i) => pw[i] * (u * LIST - f0 * FEE - pf * lam * (FEE + 0.15 * u * LIST)));
+    let bi = 0; ev.forEach((v, i) => { if (v > ev[bi]) bi = i; });
+    const declined = ev[bi] <= 0;
+    const W = 360, H = 230, pad = { l: 44, r: 14, t: 28, b: 36 };
+    const xT = [1.0, 1.3, 1.6, 1.9, 2.2];
+    let a = axes(pwin, W, H, pad, xT, [0, 0.25, 0.5, 0.75, 1], v => v.toFixed(1) + '×', v => Math.round(v * 100) + '%', 'markup over list price', 'P(win)');
+    polyline(pwin, grid.map((u, i) => [a.sx(u), a.sy(pw[i])]), css('--s1'));
+    el('line', { x1: a.sx(L), x2: a.sx(L), y1: pad.t, y2: H - pad.b, stroke: css('--s2'), 'stroke-width': 1.5, 'stroke-dasharray': '4 3' }, pwin);
+    txt(pwin, a.sx(L) + 4, pad.t + 10, 'competitor ' + L.toFixed(2) + '×', { fill: css('--ink-2') });
+    if (!declined) el('circle', { cx: a.sx(grid[bi]), cy: a.sy(pw[bi]), r: 5, fill: css('--s1'), stroke: css('--surface'), 'stroke-width': 2 }, pwin);
+    const yMax = Math.max(20, Math.ceil(Math.max(...ev) / 10) * 10), yMin = Math.min(-10, Math.floor(Math.min(...ev) / 10) * 10);
+    const yT = []; for (let y = yMin; y <= yMax + 1e-9; y += (yMax - yMin) / 4) yT.push(Math.round(y));
+    a = axes(ev_, W, H, pad, xT, yT, v => v.toFixed(1) + '×', v => '€' + v, 'markup over list price', 'expected margin per request');
+    el('line', { x1: pad.l, x2: W - pad.r, y1: a.sy(0), y2: a.sy(0), stroke: css('--axis'), 'stroke-width': 1 }, ev_);
+    polyline(ev_, grid.map((u, i) => [a.sx(u), a.sy(ev[i])]), css('--s1'));
+    if (!declined) {
+      el('circle', { cx: a.sx(grid[bi]), cy: a.sy(ev[bi]), r: 6, fill: css('--s1'), stroke: css('--surface'), 'stroke-width': 2 }, ev_);
+      txt(ev_, a.sx(grid[bi]), a.sy(ev[bi]) - 12, 'quote ' + grid[bi].toFixed(2) + '×', { 'text-anchor': 'middle', fill: css('--ink'), 'font-weight': 600 });
+    } else txt(ev_, (pad.l + W - pad.r) / 2, pad.t + 40, 'no markup pays: decline', { 'text-anchor': 'middle', fill: css('--ink'), 'font-weight': 600 });
+    readout.textContent = declined
+      ? `Best EV €${ev[bi].toFixed(1)} at ${grid[bi].toFixed(2)}× → declined (quote 5× list).`
+      : `Quote ${grid[bi].toFixed(2)}× list = €${(grid[bi] * LIST).toFixed(0)} · P(win) ${Math.round(pw[bi] * 100)}% · expected margin €${ev[bi].toFixed(1)} per request · opening fee ${f0.toFixed(2)}× = €${(f0 * FEE).toFixed(0)}`;
+  }
+  const ev_ = document.getElementById('ev');
+  for (const id of ['cL', 'cPf', 'cLam']) document.getElementById(id).addEventListener('input', drawPricing);
+
+  // ---------- fees
+  function drawFees() {
+    const W = 720, H = 240, pad = { l: 44, r: 16, t: 24, b: 36 };
+    const xT = [24, 20, 16, 12, 8, 4, 0];
+    const a0 = axes(fees, W, H, pad, [0, 4, 8, 12, 16, 20, 24], [0.5, 1.0, 1.5, 2.0, 2.5], v => (24 - v) + ' h', v => v.toFixed(1) + '×', 'hours before the last safe pickup', 'fee ÷ typical fee');
+    const sx = (hBefore) => a0.sx(24 - hBefore), sy = a0.sy;
+    // ours, risk 0.20: 0.98 until -7h, 1.25 until -4.5h, 1.5 until -3h, then steep 1.5, 1.75, 2.0, 2.25, 2.5 each 30 min
+    const ours = [[24, 0.98], [7, 0.98], [7, 1.25], [4.5, 1.25], [4.5, 1.5], [3, 1.5], [2.5, 1.5], [2.5, 1.75], [2, 1.75], [2, 2.0], [1.5, 2.0], [1.5, 2.25], [1, 2.25], [1, 2.5], [0, 2.5]];
+    const starter = [[24, 1.0], [23, 1.0], [23, 1.1], [22, 1.1], [22, 1.2], [21, 1.2], [21, 1.3], [20, 1.3], [20, 1.4], [19, 1.4], [19, 1.5], [3, 1.5], [3, 1.5], [2.5, 1.5], [2.5, 1.75], [2, 1.75], [2, 2.0], [1.5, 2.0], [1.5, 2.25], [1, 2.25], [1, 2.5], [0, 2.5]];
+    polyline(fees, starter.map(p => [sx(p[0]), sy(p[1])]), css('--s2'));
+    polyline(fees, ours.map(p => [sx(p[0]), sy(p[1])]), css('--s1'));
+    el('line', { x1: sx(3), x2: sx(3), y1: pad.t, y2: H - pad.b, stroke: css('--axis'), 'stroke-width': 1, 'stroke-dasharray': '4 3' }, fees);
+    txt(fees, sx(3) - 4, pad.t + 10, 'deadline_close warning (3 h)', { 'text-anchor': 'end', fill: css('--ink-2') });
+    txt(fees, sx(7) + 4, sy(1.25) - 6, '1.25× at −7 h', { fill: css('--ink-2') });
+    txt(fees, sx(4.5) + 4, sy(1.5) - 6, '1.5× at −4.5 h', { fill: css('--ink-2') });
+    txt(fees, sx(24) + 4, sy(0.98) + 14, 'opens at (0.92 + 0.30·risk)×', { fill: css('--ink-2') });
+  }
+
+  // ---------- leaders
+  function bars(svg, rows, maxV, fmt, title) {
+    const W = 360, H = 200, pad = { l: 124, r: 48, t: 26, b: 10 };
+    svg.innerHTML = '';
+    txt(svg, pad.l, 14, title, { fill: css('--ink-2'), 'font-weight': 600, 'font-size': 12 });
+    const bh = 18, gap = (H - pad.t - pad.b - rows.length * bh) / (rows.length - 1);
+    rows.forEach((r, i) => {
+      const y = pad.t + i * (bh + gap), w = (r.v / maxV) * (W - pad.l - pad.r);
+      txt(svg, pad.l - 8, y + bh - 5, r.name, { 'text-anchor': 'end', fill: css(r.us ? '--ink' : '--ink-2'), 'font-weight': r.us ? 600 : 400 });
+      const p = el('path', { d: `M${pad.l},${y} h${Math.max(0, w - 4)} a4,4 0 0 1 4,4 v${bh - 8} a4,4 0 0 1 -4,4 h${-Math.max(0, w - 4)} z`, fill: r.us ? css('--s1') : css('--axis') }, svg);
+      p.setAttribute('role', 'img'); p.setAttribute('aria-label', r.name + ' ' + fmt(r.v));
+      txt(svg, pad.l + w + 6, y + bh - 5, fmt(r.v), { fill: css('--ink'), 'font-variant-numeric': 'tabular-nums' });
+    });
+  }
+  function drawLeaders() {
+    const teams = [['House best', 465, 35], ['Juhus', 339, 45], ['EX-ACTUM', 278, 32, true], ['Bob the builders', 197, 43], ['Team Alpha', 156, 35]];
+    bars(orders, teams.map(t => ({ name: t[0], v: t[1], us: t[3] })), 500, v => String(v), 'Orders won');
+    bars(perorder, teams.map(t => ({ name: t[0], v: t[2], us: t[3] })), 50, v => '€' + v, 'Margin per order');
+  }
+
+  function drawAll() { drawPricing(); drawFees(); drawLeaders(); }
+  drawAll();
+  if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawAll);
+  new MutationObserver(drawAll).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+})();
+</script>
+</body>
+</html>
