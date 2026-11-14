@@ -6,7 +6,7 @@ What was built, measured and tried, so the work can continue in Claude Code. All
 
 - The cloud sandbox couldn't reach `spread.bahnexpress.com`, so every practice week ran in the Claude desktop app's browser pane, as JavaScript on the Spread origin. That's why the bot is written in JavaScript. It runs unchanged under Node 22 (`spread-bot.mjs`).
 - The kit starter was ported first and checked to the cent: −€72,612.51 on `spread-1`, level 8, exactly as the handbook says. That proves the desk/bookkeeping port is faithful.
-- A week takes about 80–200 s depending on server load. Eight weeks run in parallel, which is the practice-slot limit.
+- A week takes about 80–200 s depending on server load. Eight weeks run in parallel, which is the practice-slot limit. (Saturday: the rate limit is per team, so parallel weeks only help while a week waits on the network; see README, Request budget.)
 - With Node on your Mac: `node spread-bot.mjs --seeds v-1,v-2,v-3,v-4,v-5,v-6,v-7,v-8 --params '{...}'` runs a sweep and prints the total.
 
 ## 2. What the data showed (exploration runs)
@@ -227,3 +227,15 @@ F loses about €2k a week on unseen seeds against v-1…v-8 (€11.2k): that mu
 - The live clock: 18 s per weekday hour (3.3 world minutes a second), 3 s per hour at night and at the weekend. A price request's 15 minutes are 4.5 real seconds in the day.
 - `play_final` now prints every refused action (`refused: ...` on stderr); before, `desk.log` kept them silently.
 - A harness that runs the real `play_final` against a practice world whose clock a thread moves in real time: quotes arrive with 11–15 of their 15 minutes left, none refused.
+- **Full-day live-clock check:** v-3 Monday in the harness won 82 orders against 81 in `play_practice`, all 219 quotes in time (8–15 of their 15 minutes left). One harmless refusal: a reprice on a gig that had just been booked. The final loop plays like practice.
+
+**Request budget.** The organisers say a fast system plays a week in about 350 requests, a slow one 2,000, and that the rate is per team (README, Request budget). Measured on v-9: **1,112 requests, 46 s** on a quiet server, for 1,030 price requests and 12,180 events. Almost every `advance` stops at one price request. Time per 8-week sweep, at the team's rate:
+
+| Team rate | Now (8 × 1,100) | Batched (8 × ~400) |
+|---|---|---|
+| quiet server (latency-bound) | ~1 min | ~25 s |
+| 170 a second (60 teams) | ~52 s | ~19 s |
+| 50 a second (200 teams) | ~3 min | ~1 min |
+| 20 a second (a final runs) | ~7 min (seen at 14:00) | ~2.7 min |
+
+Batching idea: stop on a price request, then advance to just before the earliest open request's `respondBy` without waking on `price_request` (still waking on everything else), and quote every open request at once. Quotes then use a few minutes more information than in the final, which answers at once, so practice drifts a little from the final; worth checking on the test seeds that the margin barely moves.

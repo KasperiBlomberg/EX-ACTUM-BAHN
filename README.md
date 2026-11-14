@@ -19,6 +19,16 @@ python3 -m spread_bot --seed v-1 --starter                        # the kit star
 
 **In the final**, the bot polls `/events`, answers each event straight away, and saves what it has learnt to `spread-state.json` every 2 seconds. After a crash, run the same command again: it rebuilds its orders from the server and reloads the state.
 
+## Request budget (from the organisers, Saturday 14 Nov)
+
+- A fast system plays a week with about **350 requests**; a slow one uses 2,000.
+- Put the actions in the `advance` call, up to 50 in one request.
+- Use `untilEvent` to go to the next event; do not step minute by minute.
+- `advance` returns the new events: do not call `/events` or `/score` after each step.
+- The rate limit is for the **whole team**: 8 weeks in parallel are not faster than 8 weeks one after another once the team is at its limit. Parallel weeks only help while each week waits on the network round trip.
+
+The bot already does the first three. It uses about **1,100 requests a week** (v-9, measured), because it wakes on every price request (about 1,030 a week). Answering requests in batches would bring it near 350; see `OPTIMIZATION_LOG.md` section 10.
+
 ## Layout
 
 | File | What |
