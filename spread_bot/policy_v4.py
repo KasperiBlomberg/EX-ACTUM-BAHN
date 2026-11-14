@@ -103,6 +103,12 @@ class PolicyV4:
         # dealer whose count is at most lowTrustMax, a dealer-site car is admitted down to
         # minSlackLowTrust minutes of slack (0 = off: minSlack for everyone).
         "minSlackLowTrust": 0, "lowTrustMax": 2,
+        # After a drop or a no-show the gig is back in the app and notifies again.  The step up
+        # to f1 that on_unbooked sends at once cost EUR 820 a week in three ranking runs (fee
+        # 0.94 -> 1.25 x typical on 177 rebookings, half of them rebooked within 20 minutes).
+        # With at least dropHoldLead minutes to the last pickup the gig keeps its schedule,
+        # whose rises before the warning still come.  0 = always step up (the old behaviour).
+        "dropHoldLead": 0,
         "uMin": 1.0, "uMax": 2.3, "minEv": 0, "k": 11, "war": 0.15, "daySd": 0.12, "declineMult": 5,
     }
 
@@ -916,6 +922,9 @@ class PolicyV4:
         if not items or any(order["id"] in desk.urgent for order, _ in items):
             return
         p = self.params
+        if p["dropHoldLead"] and min(order["lastPickupAt"] for order, _ in items) - e["at"] >= p["dropHoldLead"]:
+            self.stats["dropHeld"] = self.stats.get("dropHeld", 0) + 1
+            return
         post = desk.posts.get(e["gigId"])
         cur = max([s["feeCents"] for s in (post["schedule"] if post else []) if s["at"] <= desk.now], default=0)
         normal = self.fees_bundle(desk, items, False) if len(items) > 1 else self.fees(desk, items[0][0], len(items[0][1]), False)

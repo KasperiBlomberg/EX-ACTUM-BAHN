@@ -45,6 +45,12 @@ EXPERIMENTS = {
     "accept_slack330": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "minSlack": 330},
     "accept_slack300": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "minSlack": 300},
     "low_trust_slack": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "minSlackLowTrust": 240},
+    # Found in the ranking runs of 14 Nov, each against lanes_trust: no fee step-up on a drop
+    # with time to spare; private trade-ins (typical fee 0.57 x list, all declined so far);
+    # longer lanes (400-550 km earns EUR 73 an order at an ordinary late share).
+    "drop_hold": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "dropHoldLead": 600},
+    "tradein_private": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "tradeinPriv": True},
+    "accept_km650": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "maxKm": 650},
     "accept_km600": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "maxKm": 600},
     "all": {"separateOptionPricing": True, "enableDealerEffects": True, "enableBundles": True,
             "enableOffers": True, "enableSnow": True},

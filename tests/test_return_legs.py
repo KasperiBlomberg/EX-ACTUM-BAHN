@@ -415,6 +415,33 @@ class FollowOfferTests(unittest.TestCase):
         self.assertFalse(PolicyV4(PolicyV4.RANKED_DEPLOYMENT).params["enableFollowOffers"])
 
 
+class DropHoldTests(unittest.TestCase):
+    def drop(self, params: dict, last_pickup: int) -> list:
+        install_map()
+        policy = PolicyV4({**PolicyV4.RANKED_DEPLOYMENT, **params})
+        policy.homes = {"yard": 30}
+        desk = Desk(Api(), "w", 8, 600, policy)
+        req = request("a", "yard", "north")
+        desk.requests["a"] = req
+        desk.handle({"kind": "order_won", "at": 600, "order": order(req, last_pickup)})
+        actions, desk.outbox = desk.outbox, []
+        desk.read_results(actions, [{"ok": True, "id": "g1"}])
+        desk.handle({"kind": "gig_booked", "at": 610, "gigId": "g1", "driverId": "d1", "feeCents": 6500})
+        desk.now = 700
+        desk.handle({"kind": "gig_dropped", "at": 700, "gigId": "g1", "driverId": "d1"})
+        return [a for a in desk.outbox if a["type"] == "reprice"]
+
+    def test_drop_with_time_to_spare_keeps_the_fee_schedule(self):
+        self.assertEqual(self.drop({"dropHoldLead": 600}, last_pickup=2490), [])
+
+    def test_drop_close_to_the_last_pickup_still_steps_up(self):
+        [reprice] = self.drop({"dropHoldLead": 600}, last_pickup=1200)
+        self.assertGreaterEqual(reprice["schedule"][0]["feeCents"], 1.25 * 7000)
+
+    def test_default_steps_up_on_every_drop(self):
+        self.assertEqual(len(self.drop({}, last_pickup=2490)), 1)
+
+
 class LowTrustSlackTests(unittest.TestCase):
     def test_tight_car_is_quoted_only_for_a_dealer_with_little_trust_to_lose(self):
         install_map()
