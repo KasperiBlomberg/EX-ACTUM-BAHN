@@ -31,6 +31,8 @@ class Desk:
         self.posts: dict = {}       # gig id -> post action
         self.urgent: set = set()
         self.gig_info: dict = {}    # gig id -> {orderId, postedAt, firstFee, cars}
+        self.driver_positions: dict = {}  # driver id -> current place, for targeted direct offers
+        self.bundle_fallbacks: dict = {}  # id(post action) -> [(order id, legs, retry)] if a chain is refused
         self.reposts: dict = {}     # order id -> minutes of reposts after expiry
         self.log: list = []
 
@@ -39,6 +41,7 @@ class Desk:
 
     # ------------------------------------------------------------ rejoin (final / restart)
     def rejoin(self, snapshot: dict, history: list, replay_policy: bool = True) -> None:
+        self.set_driver_positions(snapshot.get("driverPositions") or [])
         posted: dict = {}
         self.booked = {g["id"] for g in snapshot["gigs"] if g["status"] in ("booked", "working", "done")}
         for gig in snapshot["gigs"]:
@@ -85,8 +88,7 @@ class Desk:
         elif kind == "order_changed":
             self.change(e["order"])
         elif kind == "order_cancelled":
-            self.orders.pop(e["orderId"], None)
-            self.leg_gigs.pop(e["orderId"], None)
+            self.cancel(e)
         elif kind == "visit_failed":
             self.retry(e["orderId"], e["leg"], e["reason"])
         elif kind == "gig_expired":
@@ -106,6 +108,9 @@ class Desk:
                 lg.pop(e["leg"], None)
             if e["orderId"] in self.orders:
                 self.orders[e["orderId"]]["deliveredAt"][e["leg"]] = e["at"]
+        tick = self.hook("tick")
+        if tick:
+            tick(self)
 
     def quote(self, request: dict) -> None:
         self.requests[request["id"]] = request
@@ -119,7 +124,9 @@ class Desk:
     def win(self, order: dict) -> None:
         if order["id"] in self.requests and order["id"] not in self.orders:
             self.orders[order["id"]] = order
-            self.post(order, undelivered(order))
+            queue = self.hook("queue_order")
+            if not queue or not queue(self, order):
+                self.post(order, undelivered(order))
 
     def change(self, order: dict) -> None:
         if order["id"] in self.orders:
@@ -131,22 +138,23 @@ class Desk:
         action = self.posts.get(gig_id)
         if not action or not any(self.leg_gigs.get(s["orderId"], {}).get(s["leg"]) == gig_id for s in action["stops"]):
             return
+        by_order: dict = {}
         for s in action["stops"]:
+            # A chain may hold legs from several orders.  Its replacement is deliberately split:
+            # re-evaluate constraints/window notes instead of assuming the old chain still fits.
+            if s["kind"] == "pickup" and self.leg_gigs.get(s["orderId"], {}).get(s["leg"]) == gig_id:
+                by_order.setdefault(s["orderId"], []).append(s["leg"])
             lg = self.leg_gigs.get(s["orderId"])
-            if lg is not None:
+            if lg is not None and lg.get(s["leg"]) == gig_id:
                 lg.pop(s["leg"], None)
-        order = self.orders.get(action["stops"][0]["orderId"])
-        if not order:
-            return
-        self.reposts.setdefault(order["id"], []).append(self.now)
-        if self.hook("post_extras"):   # recompute the stop windows from now (note hours roll to the next open day)
-            legs = [s["leg"] for s in action["stops"] if s["kind"] == "pickup" and order["deliveredAt"][s["leg"]] is None]
-            if legs:
-                self.post(order, legs, {"pickupFrom": self.now, "manualLicence": action["audience"]["manualLicence"],
-                                        "plates": any(s.get("withPlates") for s in action["stops"])})
-            return
-        stops = without_windows(action["stops"], INF)
-        self.outbox.append({**action, "stops": stops, "schedule": self.fees_for(order, pickups(action))})
+        for order_id, legs in by_order.items():
+            order = self.orders.get(order_id)
+            if not order:
+                continue
+            self.reposts.setdefault(order_id, []).append(self.now)
+            retry = {"pickupFrom": self.now, "manualLicence": action["audience"]["manualLicence"],
+                     "plates": any(s.get("withPlates") for s in action["stops"] if s["orderId"] == order_id)}
+            self.post(order, [leg for leg in legs if order["deliveredAt"][leg] is None], retry)
 
     def raise_fees(self, order_id: str) -> None:
         order = self.orders.get(order_id)
@@ -156,7 +164,7 @@ class Desk:
         self.send_post_of(order_id)
         for gig_id in self.gigs_of(order_id):
             if gig_id not in self.booked:
-                self.outbox.append({"type": "reprice", "gigId": gig_id, "schedule": self.fees_for(order, pickups(self.posts[gig_id]))})
+                self.outbox.append({"type": "reprice", "gigId": gig_id, "schedule": self.fees_for_stops(self.posts[gig_id]["stops"])})
 
     def fees_for(self, order: dict, cars: int) -> list:
         urgent = order["id"] in self.urgent
@@ -165,6 +173,31 @@ class Desk:
         if custom:
             return custom
         fee = self.requests[order["id"]]["referenceFeeCents"] * cars / len(order["legs"])
+        return steep(self.now, fee, self.level) if urgent else rising(self.now, fee, self.level)
+
+    def fee_items(self, stops: list) -> list:
+        """Return the undelivered pickup legs in a post, grouped by order."""
+        found: dict = {}
+        for s in stops:
+            if s["kind"] == "pickup" and s["orderId"] in self.orders:
+                found.setdefault(s["orderId"], []).append(s["leg"])
+        return [(self.orders[order_id], legs) for order_id, legs in found.items()]
+
+    def fees_for_stops(self, stops: list) -> list:
+        items = self.fee_items(stops)
+        if not items:
+            return []
+        urgent = any(order["id"] in self.urgent for order, _ in items)
+        bundled = self.hook("fees_bundle")
+        if bundled:
+            custom = bundled(self, items, urgent)
+            if custom:
+                return custom
+        if len(items) == 1:
+            order, legs = items[0]
+            return self.fees_for(order, len(legs))
+        fee = sum(self.requests[order["id"]]["referenceFeeCents"] * len(legs) / len(order["legs"])
+                  for order, legs in items)
         return steep(self.now, fee, self.level) if urgent else rising(self.now, fee, self.level)
 
     def retry(self, order_id: str, leg: int, reason: str) -> None:
@@ -199,6 +232,38 @@ class Desk:
             for leg in legs:
                 self.post(order, [leg], retry)
 
+    def post_bundle(self, items: list, retry: Optional[dict] = None) -> bool:
+        """Post one valid chain for legs from several orders.
+
+        The policy chooses the route and has already checked its 12-hour road budget.  Desk still
+        owns notes, retry flags, the normal window-expiry safeguards, and all gig bookkeeping.
+        """
+        retry = retry or NO_RETRY
+        if len(items) < 2:
+            return False
+        stops, experienced, manual, plates = [], False, retry["manualLicence"], retry["plates"]
+        for order, legs in items:
+            if not legs or any(leg in self.leg_gigs.get(order["id"], {}) for leg in legs):
+                return False
+            extra_hook = self.hook("post_extras")
+            extra = extra_hook(self, order, legs, retry) if extra_hook else {}
+            experienced = experienced or any(order["legs"][leg]["car"]["premium"] for leg in legs)
+            manual = manual or bool(extra.get("manual"))
+            plates = plates or bool(extra.get("plates"))
+            r2 = {**retry, "plates": plates}
+            stops.extend(stops_for(order, legs, self.requests[order["id"]].get("note"), r2, extra))
+        stops = without_windows(stops, self.now + 120)
+        if not stops:
+            return False
+        action = {"type": "post", "stops": stops,
+                  "audience": {"experienced": experienced, "manualLicence": manual},
+                  "schedule": self.fees_for_stops(stops)}
+        if not action["schedule"]:
+            return False
+        self.outbox.append(action)
+        self.bundle_fallbacks[id(action)] = [(order["id"], list(legs), dict(retry)) for order, legs in items]
+        return True
+
     def gigs_of(self, order_id: str) -> list:
         return list(dict.fromkeys(self.leg_gigs.get(order_id, {}).values()))
 
@@ -207,7 +272,8 @@ class Desk:
             self.leg_gigs.setdefault(s["orderId"], {})[s["leg"]] = gig_id
         self.posts[gig_id] = action
         if gig_id not in self.gig_info:
-            self.gig_info[gig_id] = {"orderId": action["stops"][0]["orderId"], "postedAt": self.now,
+            order_ids = list(dict.fromkeys(s["orderId"] for s in action["stops"] if s["kind"] == "pickup"))
+            self.gig_info[gig_id] = {"orderId": action["stops"][0]["orderId"], "orderIds": order_ids, "postedAt": self.now,
                                      "firstFee": action["schedule"][0]["feeCents"], "cars": pickups(action)}
 
     def withdraw(self, order_id: str) -> bool:
@@ -215,13 +281,52 @@ class Desk:
         gigs = self.gigs_of(order_id)
         if any(g in self.booked for g in gigs):
             return False
+        repost: dict = {}
+        for g in gigs:
+            # Withdrawing one changed order removes an open chain from the app.  Put the other
+            # orders back immediately after the withdrawal rather than leaving stale gig links.
+            for s in self.posts.get(g, {}).get("stops", []):
+                if s["kind"] != "pickup" or s["orderId"] == order_id:
+                    continue
+                lg = self.leg_gigs.get(s["orderId"])
+                if lg is not None and lg.get(s["leg"]) == g:
+                    lg.pop(s["leg"], None)
+                    repost.setdefault(s["orderId"], []).append(s["leg"])
         self.leg_gigs.pop(order_id, None)
         for g in gigs:
             self.outbox.append({"type": "withdraw", "gigId": g})
+        for other_id, legs in repost.items():
+            other = self.orders.get(other_id)
+            if other:
+                self.post(other, [leg for leg in legs if other["deliveredAt"][leg] is None])
         return True
 
+    def cancel(self, event: dict) -> None:
+        """Repost live siblings when the server withdraws their open chain on a cancellation."""
+        order_id = event["orderId"]
+        self.orders.pop(order_id, None)
+        self.leg_gigs.pop(order_id, None)
+        for changed in event.get("gigs") or []:
+            if changed["outcome"] != "withdrawn":
+                continue
+            action = self.posts.get(changed["gigId"])
+            if not action:
+                continue
+            by_order: dict = {}
+            for s in action["stops"]:
+                if s["kind"] != "pickup" or s["orderId"] == order_id:
+                    continue
+                lg = self.leg_gigs.get(s["orderId"])
+                if lg is not None and lg.get(s["leg"]) == changed["gigId"]:
+                    lg.pop(s["leg"], None)
+                    by_order.setdefault(s["orderId"], []).append(s["leg"])
+            for other_id, legs in by_order.items():
+                other = self.orders.get(other_id)
+                if other:
+                    self.post(other, [leg for leg in legs if other["deliveredAt"][leg] is None])
+
     def send_post_of(self, order_id: str) -> None:
-        if any(a["type"] == "post" and a["stops"][0]["orderId"] == order_id for a in self.outbox):
+        if any(a["type"] == "post" and any(s["orderId"] == order_id for s in a["stops"]) for a in self.outbox):
             self.send()
 
     def send(self) -> None:
@@ -234,8 +339,24 @@ class Desk:
         for a, r in zip(actions, results):
             if a["type"] == "post" and r.get("ok") is True:
                 self.carry(a, r["id"])
+                self.bundle_fallbacks.pop(id(a), None)
             if r.get("ok") is False:
                 self.log.append((self.now, a["type"], r.get("reason")))
+                # A valid 12-hour chain can still be rejected when a particular order's live
+                # window is too tight.  Recover each leg rather than silently abandoning it.
+                for order_id, legs, retry in self.bundle_fallbacks.pop(id(a), []):
+                    order = self.orders.get(order_id)
+                    if order and not self.gigs_of(order_id):
+                        self.post(order, [leg for leg in legs if order["deliveredAt"][leg] is None], retry)
+
+    def set_driver_positions(self, positions: list) -> None:
+        self.driver_positions = {p["driverId"]: p["placeId"] for p in positions}
+
+    def refresh_driver_positions(self) -> dict:
+        """Read the small live-position view only when a policy is about to make direct offers."""
+        snap = self.api.snapshot(self.world_id)
+        self.set_driver_positions(snap.get("driverPositions") or [])
+        return self.driver_positions
 
 
 # ------------------------------------------------------------ helpers (ported from the starter)
@@ -340,6 +461,7 @@ def window_from_note(note: Optional[dict], window: dict, stop: str) -> dict:
 def play_practice(api, world_id: str, level: int, policy: Any, keep_events: bool = False):
     snap = api.snapshot(world_id)
     desk = Desk(api, world_id, level, snap["now"], policy)
+    desk.set_driver_positions(snap.get("driverPositions") or [])
     init = desk.hook("init")
     if init:
         init(desk)

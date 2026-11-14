@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from .desk import round_half_up, steep
+from .desk import DAY, INF, round_half_up, steep
 from .geo import P, hav, road
 from .notes import parse_note
 from .policy_v2 import CompModel, eff_deadline, leg_minutes, make_grid
@@ -14,7 +14,9 @@ from .policy_v2 import CompModel, eff_deadline, leg_minutes, make_grid
 
 class PolicyV4:
     DEFAULTS = {
-        "maxKm": 450, "minSlack": 360, "minSlackPriv": 600, "tradeinPriv": False,
+        # G beat F on every unseen v-9...v-15 seed.  The structural-risk price and hard brake
+        # remain the guardrail, so this expands only the cars whose expected risk pays for it.
+        "maxKm": 550, "minSlack": 360, "minSlackPriv": 600, "tradeinPriv": False,
         "f0": 0.92, "f0Risk": 0.30,          # opening fee = (f0 + f0Risk * pFail_town) * ref
         "f1": 1.25, "f1Lead": 420, "f2": 1.5, "f2Lead": 270,
         "costMult": 1.0,                     # fee / ref paid on a smooth booking
@@ -22,17 +24,34 @@ class PolicyV4:
         "priorW": 4,
         "targetLate": 0.06, "shadowK": 25,
         # unbooked for 4 h counts as a failure; own unbooked gigs in a town raise its risk
-        "earlyFail": 240, "backlogB": 10, "warnW": 0.4, "pendW": 0.15, "hardLate": 0.075, "hardPFail": 0.15,
+        "earlyFail": 240, "backlogB": 12, "warnW": 0.4, "pendW": 0.15, "hardLate": 0.075, "hardPFail": 0.15,
         # structural risk by slack and distance
         "riskSlack": [[480, 0.20], [720, 0.07], [1e9, 0.02]], "riskKm": [[200, 0], [300, 0.04], [1e9, 0.14]], "optRiskGap": 0.08,
+        # The price model works in effective log price: speedValue is how much a dealer values an
+        # option before comparing its price.  It lets same-day prices rise while steering tight
+        # cars to the safer later options.
+        "speedValue": {"same_day": 0.105, "next_day": 0.0, "within_3_days": -0.025}, "multiLossWeight": 0.55,
+        # Forecasts are weak evidence for ordinary cars, but summer tyres cannot be collected in
+        # snow.  Windows are also shifted below so an already-won summer-tyre car is not sent out.
+        "snowRisk": 0.055, "summerSnowRisk": 0.30,
+        # Same-yard chains wait briefly for a second order, never close to the last safe pickup.
+        "bundleWait": 22, "bundleMinLead": 390, "bundleMaxCars": 4, "bundleExtraCost": 0.72,
+        # Offers are scarce.  Use them only for a driver currently on one of our gigs near the
+        # pickup, before the warning, and pay above the app fee that they expect to rise from.
+        "offerLead": 225, "offerNearKm": 55, "offerMult": 1.18, "offerRefMult": 1.22, "offerRefresh": 15,
+        # Explicit switches let the experiment harness measure each addition against the G
+        # baseline on exactly the same worlds.
+        "separateOptionPricing": True, "enableDealerEffects": True, "enableBundles": True,
+        "enableOffers": True, "enableSnow": True, "recordTelemetry": False,
         "uMin": 1.0, "uMax": 2.3, "minEv": 0, "k": 11, "war": 0.15, "daySd": 0.12, "declineMult": 5,
     }
 
     def __init__(self, params: Optional[dict] = None):
         p = self.params = {**self.DEFAULTS, **(params or {})}
-        self.comp = CompModel(k=p["k"], war=p["war"], daySd=p["daySd"])
+        dealer = {} if p["enableDealerEffects"] else {"dealerEta": 0.0, "dealerCarry": 0.0, "dealerReact": 0.0, "dealerCap": 0.0}
+        self.comp = CompModel(k=p["k"], war=p["war"], daySd=p["daySd"], **dealer)
         self.trust: dict = {}        # dealer -> on-time count (0..25)
-        self.quoted: dict = {}       # request id -> x (log price/list, trust-adjusted)
+        self.quoted: dict = {}       # request id -> {option -> effective log price}
         self.town: dict = {}         # pickup place -> {ok, fail}
         self.order_town: dict = {}   # order -> pickup place
         self.resolved: dict = {}     # order -> 'ok' | 'fail'
@@ -43,6 +62,13 @@ class PolicyV4:
         self.pending: dict = {}      # order id -> minute its first gig was posted (until booked)
         self.unbooked: dict = {}     # order id -> minute since it has had no driver
         self.notes: dict = {}        # request id -> parsed note
+        self.snow: list = []         # [{from, to, places}], kept from forecast events
+        self.bundle_pending: dict = {}  # order id -> minute: held briefly for a same-yard chain
+        self.drivers: dict = {}      # driver id -> public profile
+        self.offered: dict = {}      # gig id -> {driver id: day}; only open direct offers
+        self.driver_offers: dict = {}  # driver id -> {day: number sent}, server allows three/day
+        self.booking_rows: dict = {}   # order id -> features at win plus booking/on-time labels
+        self.last_position_refresh = -10**9
         self.grid = make_grid(p["uMin"], p["uMax"])
         self.stats = {"quoted": 0, "declined": 0, "evNeg": 0}
 
@@ -90,6 +116,12 @@ class PolicyV4:
                 frm = max(frm, nd * 1440 + (f["pickup_open"] if f["pickup_open"] is not None else 8 * 60))
                 close = nd * 1440 + f["pickup_close"]
             to = min(to, close)
+        # Summer-tyre cars cannot be collected while snow falls at either end.  The server later
+        # moves the deadline when necessary; until then, waiting avoids an avoidable failed visit.
+        if self.params["enableSnow"] and f["summer"]:
+            blocked = self.snow_until(req["legs"][0]["pickup"]["placeId"], frm)
+            if blocked is not None:
+                frm = max(frm, blocked)
         return {"from": frm, "to": to} if to > frm else base
 
     def delivery_window_for(self, req: dict, base: dict) -> dict:
@@ -102,6 +134,25 @@ class PolicyV4:
             if base["from"] < c < to:
                 to = c
         return {"from": base["from"], "to": to}
+
+    # ------------------------------------------------------------ forecast-aware risk and windows
+    def snow_until(self, place: str, at: int) -> Optional[int]:
+        """End of snow covering ``place`` at ``at``, if a forecast is currently relevant."""
+        ends = [f["to"] for f in self.snow if place in f["places"] and f["from"] <= at < f["to"]]
+        return max(ends) if ends else None
+
+    def snow_risk(self, req: dict, opt: dict) -> float:
+        """Risk from forecast snow during the plausible collection/delivery period."""
+        if not self.params["enableSnow"]:
+            return 0.0
+        f = self.note_of(req)
+        start = max(req["respondBy"], req["legs"][0]["pickup"]["window"]["from"], f["ready_at"] or 0, f["release_at"] or 0)
+        end = eff_deadline(req, opt["deadline"])
+        places = {x["pickup"]["placeId"] for x in req["legs"]} | {x["delivery"]["placeId"] for x in req["legs"]}
+        affected = any(places.intersection(weather["places"]) and weather["from"] < end and start < weather["to"] for weather in self.snow)
+        if not affected:
+            return 0.0
+        return self.params["summerSnowRisk"] if f["summer"] else self.params["snowRisk"]
 
     # ------------------------------------------------------------ the risk of no driver, per town
     def prior_ok(self, place: str) -> float:
@@ -151,7 +202,10 @@ class PolicyV4:
     def get_state(self) -> dict:
         return {"comp": self.comp.get_state(), "trust": self.trust, "quoted": self.quoted, "town": self.town, "orderTown": self.order_town,
                 "resolved": self.resolved, "pending": self.pending, "unbooked": self.unbooked, "lastNow": self.last_now,
-                "lateOrders": self.late_orders, "doneOrders": self.done_orders, "openWarned": list(self.open_warned), "openOrders": list(self.open_orders)}
+                "lateOrders": self.late_orders, "doneOrders": self.done_orders, "openWarned": list(self.open_warned), "openOrders": list(self.open_orders),
+                "snow": self.snow, "bundlePending": self.bundle_pending, "offered": self.offered,
+                "driverOffers": self.driver_offers, "lastPositionRefresh": self.last_position_refresh,
+                "bookingRows": self.booking_rows if self.params["recordTelemetry"] else {}}
 
     def set_state(self, st: dict) -> None:
         self.comp.set_state(st["comp"])
@@ -166,6 +220,12 @@ class PolicyV4:
         self.late_orders, self.done_orders = st["lateOrders"], st["doneOrders"]
         self.open_warned.update(st["openWarned"])
         self.open_orders.update(st["openOrders"])
+        self.snow.extend(st.get("snow") or [])
+        self.bundle_pending.update(st.get("bundlePending") or {})
+        self.offered.update(st.get("offered") or {})
+        self.driver_offers.update(st.get("driverOffers") or {})
+        self.last_position_refresh = st.get("lastPositionRefresh", -10**9)
+        self.booking_rows.update(st.get("bookingRows") or {})
 
     # ------------------------------------------------------------ the policy
     def init(self, desk) -> None:
@@ -173,6 +233,41 @@ class PolicyV4:
         self.homes = {}
         for d in roster:
             self.homes[d["homePlaceId"]] = self.homes.get(d["homePlaceId"], 0) + 1
+            self.drivers[d["id"]] = d
+
+    def record_booking_row(self, desk, order: dict, at: int) -> None:
+        """Capture only information available at the moment we accept operational risk."""
+        if not self.params["recordTelemetry"] or order["id"] in self.booking_rows:
+            return
+        req = desk.requests.get(order["id"])
+        if not req:
+            return
+        option = next((o for o in req["options"] if o["kind"] == order["option"]), None)
+        if not option:
+            return
+        first = order["legs"][0]
+        pickup, delivery = first["pickup"]["placeId"], first["delivery"]["placeId"]
+        note = self.note_of(req)
+        near = sum(n for home, n in (self.homes or {}).items() if hav(P[pickup], P[home]) <= 30)
+        self.booking_rows[order["id"]] = {
+            "orderId": order["id"], "wonAt": at, "dealerId": order["dealerId"], "option": order["option"],
+            "pickupPlaceId": pickup, "deliveryPlaceId": delivery,
+            "roadKm": road(pickup, delivery)["km"], "roadMinutes": road(pickup, delivery)["minutes"],
+            "lastPickupAt": order["lastPickupAt"], "leadMinutes": order["lastPickupAt"] - at,
+            "deadline": order["deadline"], "slackMinutes": self.slack_of(req, option),
+            "priceCents": order["priceCents"], "referenceFeeCents": req["referenceFeeCents"],
+            "legs": len(order["legs"]), "private": first["pickup"]["privateAddress"] or first["delivery"]["privateAddress"],
+            "premium": any(leg["car"]["premium"] for leg in order["legs"]),
+            "electric": any(leg["car"]["electric"] for leg in order["legs"]),
+            "nearbyDriverHomes": near, "backlogAtWin": self.backlog(pickup), "townPFailAtWin": self.p_fail(pickup),
+            "manual": note["manual"], "plates": note["plates"], "summerTyres": note["summer"],
+            "forecastRisk": self.snow_risk(req, option),
+            "bookedAt": None, "bookedBeforeWarning": None, "warnedAt": None,
+            "deliveredAt": None, "onTime": None, "cancelled": False,
+        }
+
+    def booking_training_rows(self) -> list:
+        return list(self.booking_rows.values())
 
     def quote(self, desk, req: dict) -> dict:
         p = self.params
@@ -183,7 +278,8 @@ class PolicyV4:
             return next(val for lim, val in tab if v < lim)
 
         def structural(o: dict) -> float:
-            return 1 - (1 - step(p["riskSlack"], self.slack_of(req, o))) * (1 - step(p["riskKm"], km))
+            base = 1 - (1 - step(p["riskSlack"], self.slack_of(req, o))) * (1 - step(p["riskKm"], km))
+            return 1 - (1 - base) * (1 - self.snow_risk(req, o))
 
         ok_opts = [o for o in req["options"] if km <= p["maxKm"] and self.slack_of(req, o) >= (p["minSlackPriv"] if priv else p["minSlack"])
                    and not (len(req["legs"]) > 1 and priv and not p["tradeinPriv"])]
@@ -194,30 +290,67 @@ class PolicyV4:
         if not ok_opts:
             self.stats["declined"] += 1
             return prices
-        o, ref = ok_opts[0], req["referenceFeeCents"]
-        lst = o["listPriceCents"]
         t = 1 + 0.01 * self.trust.get(req["dealerId"], 0)
-        pw = self.comp.p_win(req["arrivedAt"], [math.log(u / t) for u in self.grid])
-        pf = 1 - (1 - max(self.p_fail(l["pickup"]["placeId"]) for l in req["legs"])) * (1 - max(structural(o) for o in ok_opts))
         ls = self.late_share()
-        if ls >= p["hardLate"] and pf > p["hardPFail"]:   # hard brake: only safe cars, which also dilute the late share
-            self.stats["braked"] = self.stats.get("braked", 0) + 1
-            return prices
         lam = self.shadow()
-        f0 = p["f0"] + p["f0Risk"] * pf
-        best, bu = -1, None
-        for i, u in enumerate(self.grid):
-            price = u * lst
-            cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
-            ev = pw[i] * (price - cost)
-            if ev > best:
-                best, bu = ev, u
-        if best <= p["minEv"]:
+        ref = req["referenceFeeCents"]
+        town_fail = max(self.p_fail(l["pickup"]["placeId"]) for l in req["legs"])
+        if not p["separateOptionPricing"]:
+            # Pre-v5 control: one markup selected from the first eligible option and copied to
+            # every option.  Keeping this exact control makes the option-price ablation useful.
+            o = ok_opts[0]
+            pf = 1 - (1 - town_fail) * (1 - max(structural(oo) for oo in ok_opts))
+            if ls >= p["hardLate"] and pf > p["hardPFail"]:
+                self.stats["braked"] = self.stats.get("braked", 0) + 1
+                return prices
+            xs = [math.log(u / t) for u in self.grid]
+            pw = self.comp.p_win(req["arrivedAt"], xs, req["dealerId"])
+            f0 = p["f0"] + p["f0Risk"] * pf
+            best, bu = -1.0, None
+            for i, u in enumerate(self.grid):
+                price = u * o["listPriceCents"]
+                cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
+                ev = pw[i] * (price - cost)
+                if ev > best:
+                    best, bu = ev, u
+            if best <= p["minEv"] or bu is None:
+                self.stats["evNeg"] += 1
+                return prices
+            x = math.log(bu / t)
+            for oo in ok_opts:
+                prices[oo["kind"]] = round_half_up(oo["listPriceCents"] * bu / 100) * 100
+            self.quoted[req["id"]] = {oo["kind"]: x for oo in ok_opts}
+            self.stats["quoted"] += 1
+            return prices
+        learnt: dict = {}
+        quoted_any = False
+        for o in ok_opts:
+            # Each delivery option has its own slack, snow exposure and dealer speed value.  The
+            # effective log price is also the correct value to learn from when this option wins.
+            pf = 1 - (1 - town_fail) * (1 - structural(o))
+            if ls >= p["hardLate"] and pf > p["hardPFail"]:
+                continue
+            speed = p["speedValue"].get(o["kind"], 0.0)
+            xs = [math.log(u / t) - speed for u in self.grid]
+            pw = self.comp.p_win(req["arrivedAt"], xs, req["dealerId"])
+            f0 = p["f0"] + p["f0Risk"] * pf
+            best, bu = -1.0, None
+            for i, u in enumerate(self.grid):
+                price = u * o["listPriceCents"]
+                cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
+                ev = pw[i] * (price - cost)
+                if ev > best:
+                    best, bu = ev, u
+            if best > p["minEv"] and bu is not None:
+                prices[o["kind"]] = round_half_up(o["listPriceCents"] * bu / 100) * 100
+                learnt[o["kind"]] = math.log(bu / t) - speed
+                quoted_any = True
+        if not quoted_any:
+            if ls >= p["hardLate"]:
+                self.stats["braked"] = self.stats.get("braked", 0) + 1
             self.stats["evNeg"] += 1
             return prices
-        for oo in ok_opts:
-            prices[oo["kind"]] = round_half_up(oo["listPriceCents"] * bu / 100) * 100
-        self.quoted[req["id"]] = math.log(bu / t)
+        self.quoted[req["id"]] = learnt
         self.stats["quoted"] += 1
         return prices
 
@@ -225,11 +358,23 @@ class PolicyV4:
         self.last_now = max(self.last_now, e["at"])
         self.sweep_pending(e["at"])
         kind = e["kind"]
-        if kind == "order_won":
+        if kind == "forecast":
+            forecast = {"from": e["from"], "to": e["to"], "places": e["placeIds"]}
+            if forecast not in self.snow:
+                self.snow.append(forecast)
+            # No later quote can be affected by a forecast that has already passed.
+            self.snow = [f for f in self.snow if f["to"] > e["at"]]
+        elif kind == "order_won":
             oid = e["order"]["id"]
             if oid in self.quoted:
                 r = desk.requests.get(oid)
-                self.comp.observe(r["arrivedAt"] if r else e["at"], self.quoted.pop(oid), True)
+                options = self.quoted.pop(oid)
+                # Saved state from the pre-option policy contains one float; retain its learning
+                # signal on a rolling deploy instead of failing the event handler.
+                x = options.get(e["order"]["option"]) if isinstance(options, dict) else options
+                if x is not None:
+                    self.comp.observe(r["arrivedAt"] if r else e["at"], x, True, e["order"]["dealerId"])
+            self.record_booking_row(desk, e["order"], e["at"])
             self.order_town[oid] = e["order"]["legs"][0]["pickup"]["placeId"]
             self.open_orders.add(oid)
             self.pending[oid] = e["at"]
@@ -237,30 +382,55 @@ class PolicyV4:
         elif kind == "order_lost":
             if e["requestId"] in self.quoted:
                 r = desk.requests.get(e["requestId"])
-                self.comp.observe(r["arrivedAt"] if r else e["at"], self.quoted.pop(e["requestId"]), False)
+                options = self.quoted.pop(e["requestId"])
+                # A loss reveals that even the dealer's best-effective option did not win.  It
+                # does not reveal which alternative the dealer compared, so use a discounted
+                # update.  Wins, in contrast, always use the option actually chosen above.
+                if options:
+                    x = min(options.values()) if isinstance(options, dict) else options
+                    self.comp.observe(r["arrivedAt"] if r else e["at"], x, False,
+                                      r["dealerId"] if r else None,
+                                      self.params["multiLossWeight"] if isinstance(options, dict) and len(options) > 1 else 1.0)
         elif kind == "gig_booked":
             info = desk.gig_info.get(e["gigId"])
-            oid = info["orderId"] if info else None
-            if oid:
+            for oid in (info.get("orderIds") or [info["orderId"]]) if info else []:
+                row = self.booking_rows.get(oid)
+                if row and row["bookedAt"] is None:
+                    row["bookedAt"] = e["at"]
+                    row["bookedBeforeWarning"] = row["warnedAt"] is None
                 self.pending.pop(oid, None)
                 self.unbooked.pop(oid, None)
                 if oid not in self.open_warned:
                     self.resolve(oid, "ok")
         elif kind == "deadline_close":
+            row = self.booking_rows.get(e["orderId"])
+            if row and row["warnedAt"] is None:
+                row["warnedAt"] = e["at"]
+                if row["bookedBeforeWarning"] is None:
+                    row["bookedBeforeWarning"] = False
             self.resolve(e["orderId"], "fail")
             self.pending.pop(e["orderId"], None)
             if e["orderId"] in self.open_orders:
                 self.open_warned.add(e["orderId"])
         elif kind == "order_cancelled":
+            row = self.booking_rows.get(e["orderId"])
+            if row:
+                row["cancelled"] = True
             self.open_orders.discard(e["orderId"])
             self.open_warned.discard(e["orderId"])
             self.pending.pop(e["orderId"], None)
             self.unbooked.pop(e["orderId"], None)
+            self.bundle_pending.pop(e["orderId"], None)
         elif kind in ("gig_dropped", "no_show"):
             info = desk.gig_info.get(e["gigId"])
-            oid = info["orderId"] if info else None
-            if oid and oid in self.open_orders:
-                self.unbooked[oid] = e["at"]
+            for oid in (info.get("orderIds") or [info["orderId"]]) if info else []:
+                if oid in self.open_orders:
+                    self.unbooked[oid] = e["at"]
+        elif kind == "offer_answered":
+            if e["gigId"] in self.offered:
+                self.offered[e["gigId"]].pop(e["driverId"], None)
+                if not self.offered[e["gigId"]]:
+                    self.offered.pop(e["gigId"], None)
         elif kind == "delivered":
             o = desk.orders.get(e["orderId"])
             if not o:
@@ -274,8 +444,165 @@ class PolicyV4:
                 self.open_warned.discard(e["orderId"])
                 self.unbooked.pop(e["orderId"], None)
                 self.done_orders += 1
+                row = self.booking_rows.get(e["orderId"])
+                if row:
+                    row["deliveredAt"] = e["at"]
+                    row["onTime"] = on_time
                 if not on_time:
                     self.late_orders += 1
+
+    # ------------------------------------------------------------ short holding queue and chains
+    def queue_order(self, desk, order: dict) -> bool:
+        """Hold an ordinary one-car order just long enough to find a same-yard partner."""
+        if not self.params["enableBundles"]:
+            return False
+        if len(order["legs"]) != 1:
+            return False                         # preserve the special trade-in stop order
+        req = desk.requests.get(order["id"])
+        leg = order["legs"][0]
+        if not req or leg["pickup"]["privateAddress"] or leg["delivery"]["privateAddress"]:
+            return False
+        option = next((o for o in req["options"] if o["kind"] == order["option"]), req["options"][0])
+        if self.note_of(req)["summer"] and self.snow_risk(req, option):
+            return False
+        if order["lastPickupAt"] - desk.now < self.params["bundleMinLead"]:
+            return False
+        self.bundle_pending[order["id"]] = desk.now
+        return True
+
+    @staticmethod
+    def chain_minutes(items: list) -> int:
+        minutes, previous = 0, None
+        for order, leg in items:
+            pickup = order["legs"][leg]["pickup"]["placeId"]
+            delivery = order["legs"][leg]["delivery"]["placeId"]
+            if previous is not None:
+                minutes += road(previous, pickup)["minutes"]
+            minutes += road(pickup, delivery)["minutes"]
+            previous = delivery
+        return minutes
+
+    def best_chain(self, desk, order_ids: list) -> list:
+        """Oldest-first nearest-neighbour chain, bounded by the 12-hour map-driving rule."""
+        candidates = [desk.orders[oid] for oid in order_ids if oid in desk.orders and oid in self.bundle_pending
+                      and not desk.gigs_of(oid) and desk.orders[oid]["deliveredAt"][0] is None]
+        if len(candidates) < 2:
+            return []
+        candidates.sort(key=lambda o: self.bundle_pending[o["id"]])
+        selected = [(candidates[0], 0)]
+        remaining = candidates[1:]
+        while remaining and len(selected) < self.params["bundleMaxCars"]:
+            previous = selected[-1][0]["legs"][0]["delivery"]["placeId"]
+            remaining.sort(key=lambda o: road(previous, o["legs"][0]["pickup"]["placeId"])["minutes"] +
+                           road(o["legs"][0]["pickup"]["placeId"], o["legs"][0]["delivery"]["placeId"])["minutes"])
+            nxt = remaining.pop(0)
+            trial = selected + [(nxt, 0)]
+            if self.chain_minutes(trial) <= 12 * 60:
+                selected = trial
+        return selected if len(selected) > 1 else []
+
+    def flush_chains(self, desk) -> None:
+        p = self.params
+        for oid in list(self.bundle_pending):
+            order = desk.orders.get(oid)
+            if not order or desk.gigs_of(oid) or order["deliveredAt"][0] is not None:
+                self.bundle_pending.pop(oid, None)
+        by_yard: dict = {}
+        for oid in self.bundle_pending:
+            order = desk.orders.get(oid)
+            if order:
+                by_yard.setdefault(order["legs"][0]["pickup"]["placeId"], []).append(oid)
+        for ids in by_yard.values():
+            chain = self.best_chain(desk, ids)
+            if chain and desk.post_bundle([(o, [leg]) for o, leg in chain]):
+                for o, _ in chain:
+                    self.bundle_pending.pop(o["id"], None)
+        for oid, queued_at in list(self.bundle_pending.items()):
+            if desk.now - queued_at >= p["bundleWait"]:
+                order = desk.orders.get(oid)
+                self.bundle_pending.pop(oid, None)
+                if order and not desk.gigs_of(oid) and order["deliveredAt"][0] is None:
+                    desk.post(order, [0])
+
+    # ------------------------------------------------------------ direct offers to active nearby drivers
+    def current_fee(self, desk, gig_id: str) -> int:
+        post = desk.posts.get(gig_id)
+        if not post:
+            return 0
+        return max((step["feeCents"] for step in post["schedule"] if step["at"] <= desk.now),
+                   default=post["schedule"][0]["feeCents"])
+
+    def can_take_gig(self, driver_id: str, audience: dict) -> bool:
+        d = self.drivers.get(driver_id)
+        if not d:
+            return False
+        if audience.get("manualLicence") and d["licence"] != "manual":
+            return False
+        return not audience.get("experienced") or (d["rating"] >= 4.8 and d["completedGigs"] >= 50)
+
+    def send_targeted_offers(self, desk) -> None:
+        if not self.params["enableOffers"]:
+            return
+        h = (desk.now % DAY) / 60
+        if h < 7 or h >= 23:
+            return
+        due = []
+        for oid in self.open_orders:
+            order = desk.orders.get(oid)
+            if not order or order["status"] != "waiting" or desk.now < order["lastPickupAt"] - self.params["offerLead"]:
+                continue
+            due.extend(g for g in desk.gigs_of(oid) if g not in desk.booked)
+        due = list(dict.fromkeys(due))
+        if not due:
+            return
+        if desk.now - self.last_position_refresh >= self.params["offerRefresh"]:
+            try:
+                desk.refresh_driver_positions()
+                self.last_position_refresh = desk.now
+            except Exception:
+                return
+        day = desk.now // DAY
+        for gig_id in due:
+            post = desk.posts.get(gig_id)
+            info = desk.gig_info.get(gig_id)
+            if not post or not info or len(self.offered.get(gig_id, {})) >= 3:
+                continue
+            pickups = [s for s in post["stops"] if s["kind"] == "pickup"]
+            if not pickups:
+                continue
+            pickup = pickups[0]["orderId"]
+            order = desk.orders.get(pickup)
+            if not order:
+                continue
+            place = order["legs"][pickups[0]["leg"]]["pickup"]["placeId"]
+            candidates = []
+            for driver_id, where in desk.driver_positions.items():
+                used = self.driver_offers.get(driver_id, {}).get(str(day), 0)
+                if used >= 3 or driver_id in self.offered.get(gig_id, {}) or not self.can_take_gig(driver_id, post["audience"]):
+                    continue
+                if hav(P[where], P[place]) <= self.params["offerNearKm"]:
+                    candidates.append((hav(P[where], P[place]), driver_id))
+            fee = max(round_half_up(self.current_fee(desk, gig_id) * self.params["offerMult"]),
+                      round_half_up(info["firstFee"] * self.params["offerRefMult"]))
+            for _, driver_id in sorted(candidates)[:max(0, 3 - len(self.offered.get(gig_id, {})))]:
+                desk.outbox.append({"type": "offer", "gigId": gig_id, "driverId": driver_id, "feeCents": fee})
+                self.offered.setdefault(gig_id, {})[driver_id] = day
+                usage = self.driver_offers.setdefault(driver_id, {})
+                usage[str(day)] = usage.get(str(day), 0) + 1
+
+    def tick(self, desk) -> None:
+        self.last_now = max(self.last_now, desk.now)
+        self.sweep_pending(desk.now)
+        self.flush_chains(desk)
+        self.send_targeted_offers(desk)
+
+    def next_wake(self, desk) -> int:
+        wakes = [when + self.params["bundleWait"] for when in self.bundle_pending.values()]
+        for oid in self.open_orders:
+            order = desk.orders.get(oid)
+            if order and order["status"] == "waiting":
+                wakes.append(order["lastPickupAt"] - self.params["offerLead"])
+        return min(wakes) if wakes else INF
 
     def post_extras(self, desk, order: dict, legs: list, retry: dict) -> dict:
         req = desk.requests[order["id"]]
@@ -291,16 +618,17 @@ class PolicyV4:
         info = desk.gig_info.get(e["gigId"])
         if not info:
             return
-        order = desk.orders.get(info["orderId"])
-        if not order or order["id"] in desk.urgent:
+        items = desk.fee_items(desk.posts.get(e["gigId"], {}).get("stops", []))
+        if not items or any(order["id"] in desk.urgent for order, _ in items):
             return
         p = self.params
-        ref = desk.requests[order["id"]]["referenceFeeCents"] * info["cars"] / len(order["legs"])
         post = desk.posts.get(e["gigId"])
         cur = max([s["feeCents"] for s in (post["schedule"] if post else []) if s["at"] <= desk.now], default=0)
-        f1 = max(cur * 1.15, ref * p["f1"])
-        t2 = max(desk.now + 1, order["lastPickupAt"] - p["f2Lead"])
-        schedule = [{"at": desk.now, "feeCents": round_half_up(f1)}, {"at": t2, "feeCents": round_half_up(max(f1, ref * p["f2"]))}]
+        normal = self.fees_bundle(desk, items, False) if len(items) > 1 else self.fees(desk, items[0][0], len(items[0][1]), False)
+        f1 = max(cur * 1.15, normal[1]["feeCents"] if len(normal) > 1 else normal[0]["feeCents"])
+        t2 = max(desk.now + 1, min(order["lastPickupAt"] for order, _ in items) - p["f2Lead"])
+        f2 = max(f1, normal[-1]["feeCents"] if normal else f1)
+        schedule = [{"at": desk.now, "feeCents": round_half_up(f1)}, {"at": t2, "feeCents": round_half_up(f2)}]
         desk.outbox.append({"type": "reprice", "gigId": e["gigId"], "schedule": schedule})
         if post:
             desk.posts[e["gigId"]] = {**post, "schedule": schedule}
@@ -318,3 +646,26 @@ class PolicyV4:
         steps.append({"at": t1, "feeCents": round_half_up(ref * max(f0, p["f1"]))})
         steps.append({"at": t2, "feeCents": round_half_up(ref * max(f0, p["f2"]))})
         return steps
+
+    def fees_bundle(self, desk, items: list, urgent: bool) -> list:
+        """One lower fee schedule for a same-yard chain, with its earliest pickup driving rises."""
+        if len(items) == 1:
+            order, legs = items[0]
+            return self.fees(desk, order, len(legs), urgent)
+        p = self.params
+        refs = [desk.requests[order["id"]]["referenceFeeCents"] * len(legs) / len(order["legs"])
+                for order, legs in items]
+        total = sum(refs)
+        if urgent:
+            return steep(desk.now, total, 8)
+        town = items[0][0]["legs"][items[0][1][0]]["pickup"]["placeId"]
+        f0 = p["f0"] + p["f0Risk"] * self.p_fail(town, False)
+        # The first car bears the trip to the yard and home; each added car pays only its
+        # measured marginal share.  Escalations retain that saving but still arrive early.
+        discounted_ref = refs[0] + p["bundleExtraCost"] * sum(refs[1:])
+        opening = discounted_ref * f0
+        t1 = max(desk.now + 1, min(order["lastPickupAt"] for order, _ in items) - p["f1Lead"])
+        t2 = max(t1 + 1, min(order["lastPickupAt"] for order, _ in items) - p["f2Lead"])
+        return [{"at": desk.now, "feeCents": round_half_up(opening)},
+                {"at": t1, "feeCents": round_half_up(max(opening, discounted_ref * p["f1"]))},
+                {"at": t2, "feeCents": round_half_up(max(opening, discounted_ref * p["f2"]))}]

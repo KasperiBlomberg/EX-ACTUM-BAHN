@@ -17,10 +17,17 @@ def sig(x: float) -> float:
 
 
 class CompModel:
-    """P(win) as a function of log(price/list), as a grid posterior over the competitor's world
-    level L and the day factor D. The day factor is new each morning, with a price-war prior."""
+    """Market posterior with a global world/day price and a small dealer correction.
 
-    DEFAULTS = {"lo": 1.05, "hi": 1.95, "nL": 37, "dLo": -0.40, "dHi": 0.35, "nD": 31, "daySd": 0.12, "war": 0.15, "k": 11, "temper": 0.8}
+    The global grid learns facts shared by all dealers.  A dealer gets a short-lived correction as
+    well: the competitor cuts that dealer after we win a lot and eases off after we lose.  Keeping
+    this separate prevents one dealer's feedback loop from moving the price we quote to everybody.
+    """
+
+    DEFAULTS = {"lo": 1.05, "hi": 1.95, "nL": 37, "dLo": -0.40, "dHi": 0.35, "nD": 31, "daySd": 0.12, "war": 0.15, "k": 11, "temper": 0.8,
+                # Per-dealer terms are deliberately much smaller than the day factor.  They learn
+                # within a day and then anticipate the competitor's next-morning response.
+                "dealerEta": 0.018, "dealerCarry": 0.65, "dealerReact": 0.045, "dealerCap": 0.16}
 
     def __init__(self, **o):
         c = self.c = {**self.DEFAULTS, **o}
@@ -30,6 +37,7 @@ class CompModel:
         self.log_j: Optional[list] = None
         self.day: Optional[int] = None
         self.war_seen = False
+        self.dealer: dict = {}       # dealer -> {z, wins, n}; z is a log competitor-price offset
 
     def day_prior(self) -> list:
         c = self.c
@@ -53,9 +61,24 @@ class CompModel:
                 self.war_seen = True   # a price-war day says little about the usual level: keep the old one
             else:
                 self.log_l = [self.c["temper"] * (max(r) + math.log(sum(math.exp(v - max(r)) for v in r))) for r in self.log_j]
+            # The competitor reacts to our recent share at each dealer every morning.  Retain a
+            # little of the inferred local level, then move it in the documented opposite
+            # direction of yesterday's win share.
+            for st in self.dealer.values():
+                share = (st["wins"] / st["n"] - 0.5) * 2 if st["n"] else 0.0
+                st["z"] = self.clip(st["z"] * self.c["dealerCarry"] - self.c["dealerReact"] * share)
+                st["wins"], st["n"] = 0, 0
         self.day = d
         dp = self.day_prior()
         self.log_j = self.norm([[self.log_l[i] + dp[j] for j in range(len(self.D))] for i in range(len(self.L))])
+
+    def clip(self, z: float) -> float:
+        return max(-self.c["dealerCap"], min(self.c["dealerCap"], z))
+
+    def dealer_state(self, dealer_id: Optional[str]) -> dict:
+        if not dealer_id:
+            return {"z": 0.0, "wins": 0, "n": 0}
+        return self.dealer.setdefault(dealer_id, {"z": 0.0, "wins": 0, "n": 0})
 
     def weights(self) -> list:
         e = [[math.exp(v) for v in r] for r in self.log_j]
@@ -69,38 +92,49 @@ class CompModel:
         w = self.weights()
         return [sum(r[j] for r in w) for j in range(len(self.D))]
 
-    def observe(self, minute: int, x: float, won: bool) -> None:
+    def observe(self, minute: int, x: float, won: bool, dealer_id: Optional[str] = None, weight: float = 1.0) -> None:
         self.at(minute)
         k, L, D = self.c["k"], self.L, self.D
+        st = self.dealer_state(dealer_id)
+        z = st["z"]
+        predicted = self.p_win(minute, [x], dealer_id)[0]
         out = []
         for i, r in enumerate(self.log_j):
             row = []
             for j, v in enumerate(r):
-                p = min(1 - 1e-6, max(1e-6, sig(k * (L[i] + D[j] - x))))
-                row.append(v + math.log(p if won else 1 - p))
+                p = min(1 - 1e-6, max(1e-6, sig(k * (L[i] + D[j] + z - x))))
+                row.append(v + weight * math.log(p if won else 1 - p))
             out.append(row)
         self.log_j = self.norm(out)
 
-    def p_win(self, minute: int, xs: list) -> list:
+        # A gradient step on the local log-price term makes the correction react after only a few
+        # requests.  The global posterior above still gets the full, correctly adjusted evidence.
+        st["z"] = self.clip(z + self.c["dealerEta"] * weight * ((1.0 if won else 0.0) - predicted))
+        st["wins"] += weight if won else 0
+        st["n"] += weight
+
+    def p_win(self, minute: int, xs: list, dealer_id: Optional[str] = None) -> list:
         """xs: log(price/list) for each candidate; returns P(win) for each."""
         self.at(minute)
         w = self.weights()
         k, L, D = self.c["k"], self.L, self.D
+        z = self.dealer_state(dealer_id)["z"]
         out = []
         for x in xs:
             p = 0.0
             for i in range(len(L)):
                 for j in range(len(D)):
                     if w[i][j] > 1e-7:
-                        p += w[i][j] * sig(k * (L[i] + D[j] - x))
+                        p += w[i][j] * sig(k * (L[i] + D[j] + z - x))
             out.append(p)
         return out
 
     def get_state(self) -> dict:
-        return {"logL": self.log_l, "logJ": self.log_j, "day": self.day, "warSeen": self.war_seen}
+        return {"logL": self.log_l, "logJ": self.log_j, "day": self.day, "warSeen": self.war_seen, "dealer": self.dealer}
 
     def set_state(self, st: dict) -> None:
         self.log_l, self.log_j, self.day, self.war_seen = st["logL"], st["logJ"], st["day"], st["warSeen"]
+        self.dealer = st.get("dealer") or {}
 
     def summary(self, minute: int) -> dict:
         self.at(minute)
