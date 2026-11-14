@@ -52,7 +52,9 @@ def report(label: str, s: dict) -> None:
 
 
 def make_policy(args):
-    return None if args.starter else PolicyV4(args.params)
+    # Ranked/final runs use G, the conservative validated control.  Experimental mechanisms are
+    # opt-in through --params after their own paired practice test clears the safety floor.
+    return None if args.starter else PolicyV4({**PolicyV4.SAFE_DEPLOYMENT, **args.params})
 
 
 # several seeds in parallel (max 8 practice slots): --seeds v-1,v-2,... prints one line per seed and the total
@@ -123,7 +125,7 @@ def play_final(api: Api, args) -> None:
     f = next_final(api)
     world_id = f["worldId"]
     print(f"Final world {world_id}, starts {f['startsAt']}", flush=True)
-    policy = PolicyV4(args.params)
+    policy = make_policy(args)
     # restore the policy's learnt state after a restart of this program
     saved: Optional[dict] = None
     try:

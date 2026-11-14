@@ -13,6 +13,17 @@ from .policy_v2 import CompModel, eff_deadline, leg_minutes, make_grid
 
 
 class PolicyV4:
+    # The bot played by ``python -m spread_bot`` / ``--final``.  New mechanisms stay opt-in
+    # until their own paired practice ablation clears the on-time constraint and improves margin.
+    # ``DEFAULTS`` below remain feature-complete so focused unit tests and explicit experiments
+    # can construct the individual mechanisms without boilerplate.
+    SAFE_DEPLOYMENT = {
+        "separateOptionPricing": False,
+        "enableDealerEffects": False,
+        "enableBundles": False,
+        "enableOffers": False,
+        "enableSnow": False,
+    }
     DEFAULTS = {
         # G beat F on every unseen v-9...v-15 seed.  The structural-risk price and hard brake
         # remain the guardrail, so this expands only the cars whose expected risk pays for it.

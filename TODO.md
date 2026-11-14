@@ -27,6 +27,21 @@ G scored **€9,551 / €9,386 / €8,249** on `v-18 / v-19 / v-20`, with **98.2
 on-time performance and 278 / 295 / 308 orders won. These are control measurements only;
 compare each feature on these same seeds before attributing a difference to it.
 
+### Direct-offer ablation — v-18...v-20 (do not promote yet)
+
+With direct offers as the only change, mean margin was **€9,062.19** versus the control's
+**€9,062.28**; worst on-time was unchanged at **98.2%** and all three weeks ranked. The policy
+sent 71 offers: 67 were answered, only **1 (1.5% of answers)** was accepted, and that order was
+on time. The policy is not harmful on this small sample, but this fee/targeting rule has not
+earned its cost. Keep it off until a changed candidate beats the control on further held-out seeds.
+
+### Option-price ablation — v-18...v-20 (current speed values rejected)
+
+Option-specific pricing averaged **€8,671.51**, versus **€9,062.28** for G (−€390.77), won
+286.0 versus 293.7 orders, and reduced worst-seed on-time from **98.2%** to **97.4%**. It remains
+safe on this sample but is not competitive with the current hand-set speed values. Do not promote
+it; revisit only through the planned speed-value sweep / dealer-choice fit.
+
 ## 2. Tune existing knobs — next
 
 Use common seeds for every candidate. Search small related groups, not every parameter at once.
@@ -74,3 +89,10 @@ The present Bayesian model is global/day/dealer price level with hand-set speed 
 - [x] Log offer context, fee above app price, driver position, response, and later order outcome.
 - [ ] Compare candidate selection rules on safe held-out experiments.
 - [ ] Only increase offer volume if marginal accepted offers improve on-time margin.
+
+### Preliminary booking-model check — v-18...v-20
+
+The held-out-seed partial-pooling model had Brier **0.0134** on 881 labelled orders, versus
+**0.0407** for the town heuristic. But booking failures were rare (about 1.4%) and every model
+prediction landed below 20% risk; this is a promising calibration baseline, not evidence that it
+can yet separate genuinely risky cars. Collect more varied weeks before feeding it into live quotes.

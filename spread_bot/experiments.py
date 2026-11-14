@@ -20,13 +20,7 @@ from .policy_v4 import PolicyV4
 
 SELECTION_FLOOR = 0.93
 
-G_CONTROL = {
-    "separateOptionPricing": False,
-    "enableDealerEffects": False,
-    "enableBundles": False,
-    "enableOffers": False,
-    "enableSnow": False,
-}
+G_CONTROL = PolicyV4.SAFE_DEPLOYMENT
 
 # Each feature run differs from G_CONTROL in exactly one change.  ``all`` is the current policy.
 EXPERIMENTS = {
@@ -36,7 +30,8 @@ EXPERIMENTS = {
     "chains": {**G_CONTROL, "enableBundles": True},
     "direct_offers": {**G_CONTROL, "enableOffers": True},
     "snow": {**G_CONTROL, "enableSnow": True},
-    "all": {},
+    "all": {"separateOptionPricing": True, "enableDealerEffects": True, "enableBundles": True,
+            "enableOffers": True, "enableSnow": True},
 }
 
 
