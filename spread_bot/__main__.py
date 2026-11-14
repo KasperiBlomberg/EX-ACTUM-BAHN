@@ -160,10 +160,13 @@ def play_final(api: Api, args) -> None:
                 desk.handle(e)
             except Exception as err:
                 print("handle", e["kind"], repr(err), file=sys.stderr, flush=True)
+        n_log = len(desk.log)
         try:
             desk.send()
         except Exception as e:
             print("send:", str(e), file=sys.stderr, flush=True)
+        for entry in desk.log[n_log:]:
+            print("refused:", entry, file=sys.stderr, flush=True)
         if not evs:
             time.sleep(0.3)
             try:

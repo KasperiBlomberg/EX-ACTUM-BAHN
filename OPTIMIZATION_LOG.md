@@ -203,3 +203,27 @@ Porting notes: Python's `re` has no `\p{L}`, so `notes.py` builds the letter cla
 `maxKm 450`, `minSlack 360`, `minSlackPriv 600`, `f0 0.92`, `f0Risk 0.30`, `f1 1.25 @ lastPickup−420`, `f2 1.5 @ lastPickup−270`, `failRef 1.0`, `failPrice 0.15`, `targetLate 0.06`, `shadowK 25`, `earlyFail 240`, `backlogB 10`, `warnW 0.4`, `pendW 0.15`, `hardLate 0.075`, `hardPFail 0.15`, `riskSlack [[480,.20],[720,.07],[∞,.02]]`, `riskKm [[200,0],[300,.04],[∞,.14]]`, `optRiskGap 0.08`, competitor model `k 11`, `war 0.15`, `daySd 0.12`, level grid 1.05–1.95, day grid −0.40…+0.35, `temper 0.8`.
 
 G = F + `{"backlogB":12,"maxKm":550}`.
+
+## 10. Saturday 14 Nov: unseen seeds, the first test final
+
+**F and G on unseen seeds v-9…v-16** (level 8, Python bot). v-16's world disappeared mid-run for G (404 on advance), so G compares on 7 seeds.
+
+| Seed | F margin | F on time | G margin | G on time |
+|---|---|---|---|---|
+| v-9 | €10,099 | 95.1% | €10,754 | 93.0% |
+| v-10 | €5,932 | 94.2% | €6,735 | 93.9% |
+| v-11 | €9,197 | 93.0% | €10,998 | 93.7% |
+| v-12 | €8,165 | 99.7% | €8,675 | 98.7% |
+| v-13 | €14,095 | 99.2% | €14,958 | 98.2% |
+| v-14 | €7,152 | 94.5% | €8,626 | 95.2% |
+| v-15 | €10,222 | 97.0% | €11,051 | 96.8% |
+| v-16 | €9,640 | 97.4% | — | — |
+| **avg (v-9…v-15)** | **€9,266** | min 93.0% | **€10,257** | min 93.0% |
+
+F loses about €2k a week on unseen seeds against v-1…v-8 (€11.2k): that much was fitted to the tuning seeds. G beats F on all 7 seeds, by €1.0k a week on average, with the same worst on-time share. From here on, **v-9 and up are the test seeds**.
+
+**Test final 14:00: 0 orders, all 1,031 requests `unquoted` in the reveal. Not a bug: the bot joined too late.** The test final is a week whose Monday–Wednesday are played before the start; the clock starts at Thursday 00:00 at 14:00 and only Thursday and Friday have live requests (the last at Friday 18:13, about 9 minutes after the start). The bot was started at 14:10:03, about a minute after the last request. Lessons:
+- **Start `--final` before the start time.** It waits on its own for the final to open.
+- The live clock: 18 s per weekday hour (3.3 world minutes a second), 3 s per hour at night and at the weekend. A price request's 15 minutes are 4.5 real seconds in the day.
+- `play_final` now prints every refused action (`refused: ...` on stderr); before, `desk.log` kept them silently.
+- A harness that runs the real `play_final` against a practice world whose clock a thread moves in real time: quotes arrive with 11–15 of their 15 minutes left, none refused.
