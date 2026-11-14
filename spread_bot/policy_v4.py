@@ -65,9 +65,13 @@ class PolicyV4:
         self.snow: list = []         # [{from, to, places}], kept from forecast events
         self.bundle_pending: dict = {}  # order id -> minute: held briefly for a same-yard chain
         self.drivers: dict = {}      # driver id -> public profile
-        self.offered: dict = {}      # gig id -> {driver id: day}; only open direct offers
+        self.offered: dict = {}      # gig id -> {driver id: {day, rowId}}; only open direct offers
         self.driver_offers: dict = {}  # driver id -> {day: number sent}, server allows three/day
         self.booking_rows: dict = {}   # order id -> features at win plus booking/on-time labels
+        # One row per direct offer.  These are deliberately observational: a gig can still be
+        # booked from the app while an offer is open, so ``gigBookedAt`` is not evidence that the
+        # offer caused the booking.  ``answer`` is the clean response label.
+        self.offer_rows: list = []
         self.last_position_refresh = -10**9
         self.grid = make_grid(p["uMin"], p["uMax"])
         self.stats = {"quoted": 0, "declined": 0, "evNeg": 0}
@@ -205,7 +209,8 @@ class PolicyV4:
                 "lateOrders": self.late_orders, "doneOrders": self.done_orders, "openWarned": list(self.open_warned), "openOrders": list(self.open_orders),
                 "snow": self.snow, "bundlePending": self.bundle_pending, "offered": self.offered,
                 "driverOffers": self.driver_offers, "lastPositionRefresh": self.last_position_refresh,
-                "bookingRows": self.booking_rows if self.params["recordTelemetry"] else {}}
+                "bookingRows": self.booking_rows if self.params["recordTelemetry"] else {},
+                "offerRows": self.offer_rows if self.params["recordTelemetry"] else []}
 
     def set_state(self, st: dict) -> None:
         self.comp.set_state(st["comp"])
@@ -226,6 +231,7 @@ class PolicyV4:
         self.driver_offers.update(st.get("driverOffers") or {})
         self.last_position_refresh = st.get("lastPositionRefresh", -10**9)
         self.booking_rows.update(st.get("bookingRows") or {})
+        self.offer_rows.extend(st.get("offerRows") or [])
 
     # ------------------------------------------------------------ the policy
     def init(self, desk) -> None:
@@ -268,6 +274,51 @@ class PolicyV4:
 
     def booking_training_rows(self) -> list:
         return list(self.booking_rows.values())
+
+    def record_offer_row(self, desk, gig_id: str, info: dict, driver_id: str, driver_place: str,
+                         pickup_place: str, app_fee: int, offer_fee: int) -> Optional[int]:
+        """Store offer context before sending it; later events only fill in labels.
+
+        We keep this separate from booking-risk rows because an offer is targeted at a particular
+        driver, and its response is not a random sample of normal app bookings.
+        """
+        if not self.params["recordTelemetry"]:
+            return None
+        order_ids = list(info.get("orderIds") or [info["orderId"]])
+        orders = [desk.orders[oid] for oid in order_ids if oid in desk.orders]
+        driver = self.drivers.get(driver_id, {})
+        outcomes = {
+            order["id"]: {
+                "deadline": order["deadline"], "warnedAt": None, "cancelled": False,
+                "deliveredAt": None, "onTime": None,
+            }
+            for order in orders
+        }
+        row = {
+            "offerId": len(self.offer_rows), "offeredAt": desk.now, "gigId": gig_id,
+            "driverId": driver_id, "driverPlaceId": driver_place, "pickupPlaceId": pickup_place,
+            "driverDistanceKm": hav(P[driver_place], P[pickup_place]), "orderIds": order_ids,
+            "cars": info.get("cars", len(order_ids)),
+            "leadMinutes": min((order["lastPickupAt"] - desk.now for order in orders), default=None),
+            "appFeeCents": app_fee, "offerFeeCents": offer_fee,
+            "feePremiumCents": offer_fee - app_fee,
+            "feePremiumFraction": ((offer_fee / app_fee) - 1) if app_fee else None,
+            "driverRating": driver.get("rating"), "driverCompletedGigs": driver.get("completedGigs"),
+            "driverDrops": driver.get("drops"), "driverLicence": driver.get("licence"),
+            "answer": None, "answeredAt": None, "gigBookedAt": None, "orderOutcomes": outcomes,
+        }
+        self.offer_rows.append(row)
+        return row["offerId"]
+
+    def offer_training_rows(self) -> list:
+        return list(self.offer_rows)
+
+    def label_offer_orders(self, order_id: str, **labels) -> None:
+        """Apply later lifecycle labels to every previous offer concerning this order."""
+        for row in self.offer_rows:
+            outcome = row["orderOutcomes"].get(order_id)
+            if outcome is not None:
+                outcome.update(labels)
 
     def quote(self, desk, req: dict) -> dict:
         p = self.params
@@ -393,6 +444,11 @@ class PolicyV4:
                                       self.params["multiLossWeight"] if isinstance(options, dict) and len(options) > 1 else 1.0)
         elif kind == "gig_booked":
             info = desk.gig_info.get(e["gigId"])
+            # This may be an ordinary app booking while an offer happens to be open.  Keep the
+            # timestamp as context, but use offer_answered/accepted as the causal response label.
+            for row in self.offer_rows:
+                if row["gigId"] == e["gigId"] and row["gigBookedAt"] is None:
+                    row["gigBookedAt"] = e["at"]
             for oid in (info.get("orderIds") or [info["orderId"]]) if info else []:
                 row = self.booking_rows.get(oid)
                 if row and row["bookedAt"] is None:
@@ -408,6 +464,7 @@ class PolicyV4:
                 row["warnedAt"] = e["at"]
                 if row["bookedBeforeWarning"] is None:
                     row["bookedBeforeWarning"] = False
+            self.label_offer_orders(e["orderId"], warnedAt=e["at"])
             self.resolve(e["orderId"], "fail")
             self.pending.pop(e["orderId"], None)
             if e["orderId"] in self.open_orders:
@@ -416,6 +473,7 @@ class PolicyV4:
             row = self.booking_rows.get(e["orderId"])
             if row:
                 row["cancelled"] = True
+            self.label_offer_orders(e["orderId"], cancelled=True)
             self.open_orders.discard(e["orderId"])
             self.open_warned.discard(e["orderId"])
             self.pending.pop(e["orderId"], None)
@@ -427,6 +485,11 @@ class PolicyV4:
                 if oid in self.open_orders:
                     self.unbooked[oid] = e["at"]
         elif kind == "offer_answered":
+            open_offer = self.offered.get(e["gigId"], {}).get(e["driverId"])
+            if isinstance(open_offer, dict) and open_offer.get("rowId") is not None:
+                row_id = open_offer["rowId"]
+                if row_id < len(self.offer_rows):
+                    self.offer_rows[row_id].update({"answer": e["answer"], "answeredAt": e["at"]})
             if e["gigId"] in self.offered:
                 self.offered[e["gigId"]].pop(e["driverId"], None)
                 if not self.offered[e["gigId"]]:
@@ -448,6 +511,7 @@ class PolicyV4:
                 if row:
                     row["deliveredAt"] = e["at"]
                     row["onTime"] = on_time
+                self.label_offer_orders(e["orderId"], deliveredAt=e["at"], onTime=on_time)
                 if not on_time:
                     self.late_orders += 1
 
@@ -580,13 +644,16 @@ class PolicyV4:
                 used = self.driver_offers.get(driver_id, {}).get(str(day), 0)
                 if used >= 3 or driver_id in self.offered.get(gig_id, {}) or not self.can_take_gig(driver_id, post["audience"]):
                     continue
-                if hav(P[where], P[place]) <= self.params["offerNearKm"]:
-                    candidates.append((hav(P[where], P[place]), driver_id))
-            fee = max(round_half_up(self.current_fee(desk, gig_id) * self.params["offerMult"]),
+                distance = hav(P[where], P[place])
+                if distance <= self.params["offerNearKm"]:
+                    candidates.append((distance, driver_id, where))
+            app_fee = self.current_fee(desk, gig_id)
+            fee = max(round_half_up(app_fee * self.params["offerMult"]),
                       round_half_up(info["firstFee"] * self.params["offerRefMult"]))
-            for _, driver_id in sorted(candidates)[:max(0, 3 - len(self.offered.get(gig_id, {})))]:
+            for _, driver_id, where in sorted(candidates)[:max(0, 3 - len(self.offered.get(gig_id, {})))]:
                 desk.outbox.append({"type": "offer", "gigId": gig_id, "driverId": driver_id, "feeCents": fee})
-                self.offered.setdefault(gig_id, {})[driver_id] = day
+                row_id = self.record_offer_row(desk, gig_id, info, driver_id, where, place, app_fee, fee)
+                self.offered.setdefault(gig_id, {})[driver_id] = {"day": day, "rowId": row_id}
                 usage = self.driver_offers.setdefault(driver_id, {})
                 usage[str(day)] = usage.get(str(day), 0) + 1
 

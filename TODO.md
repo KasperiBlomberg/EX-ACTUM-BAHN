@@ -21,6 +21,12 @@ That is +€294.49 margin but −1.6 percentage points of on-time headroom on on
 to independent seeds before keeping or rejecting any feature. The all-features runner was
 interrupted after its world ended, so this first comparison has no retained telemetry rows.
 
+### Control checkpoint — v-18...v-20 (partial validation)
+
+G scored **€9,551 / €9,386 / €8,249** on `v-18 / v-19 / v-20`, with **98.2%** worst-seed
+on-time performance and 278 / 295 / 308 orders won. These are control measurements only;
+compare each feature on these same seeds before attributing a difference to it.
+
 ## 2. Tune existing knobs — next
 
 Use common seeds for every candidate. Search small related groups, not every parameter at once.
@@ -38,7 +44,7 @@ Replace hand-tuned town risk with a calibrated probability that a gig books befo
 
 - [x] Log an order-time feature row when every order is won.
 - [x] Label whether it booked before warning and whether it arrived on time.
-- [ ] Start with a regularised hierarchical logistic model: pickup/delivery town, slack,
+- [x] Start with a regularised hierarchical logistic model: pickup/delivery town, slack,
       distance, fee, backlog, weather, vehicle/note constraints, and driver density.
 - [x] Emit Brier score and reliability bins for the current town-risk heuristic in experiment reports.
 - [ ] Validate probability calibration (Brier score / reliability bins), not only classification accuracy.
@@ -65,6 +71,6 @@ The present Bayesian model is global/day/dealer price level with hand-set speed 
 
 ## 6. Turn direct offers into a measured policy
 
-- [ ] Log offer context, fee above app price, driver position, response, and later order outcome.
+- [x] Log offer context, fee above app price, driver position, response, and later order outcome.
 - [ ] Compare candidate selection rules on safe held-out experiments.
 - [ ] Only increase offer volume if marginal accepted offers improve on-time margin.

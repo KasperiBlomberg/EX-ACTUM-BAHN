@@ -7,7 +7,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from spread_bot.experiments import EXPERIMENTS, booking_calibration, experiment_params, open_practice_slots, run_experiments, summarize
+from spread_bot.booking_model import PartialPoolingLogistic, validate_by_seed
+from spread_bot.experiments import EXPERIMENTS, booking_calibration, experiment_params, offer_effectiveness, open_practice_slots, run_experiments, summarize
 from spread_bot.policy_v4 import PolicyV4
 
 
@@ -56,6 +57,40 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(calibration["n"], 2)
         self.assertAlmostEqual(calibration["brier"], (0.2 ** 2 + 0.4 ** 2) / 2)
         self.assertEqual([item["n"] for item in calibration["bins"]], [1, 1])
+
+    def test_offer_effectiveness_uses_answers_not_app_bookings_as_acceptances(self):
+        stats = offer_effectiveness([{"offerRows": [
+            {"answer": "accepted", "gigBookedAt": 10,
+             "orderOutcomes": {"a": {"onTime": True}}},
+            {"answer": "expired", "gigBookedAt": 11,
+             "orderOutcomes": {"b": {"onTime": False}}},
+            {"answer": None, "gigBookedAt": 12, "orderOutcomes": {}},
+        ]}])
+        self.assertEqual(stats["sent"], 3)
+        self.assertEqual(stats["answered"], 2)
+        self.assertEqual(stats["accepted"], 1)
+        self.assertEqual(stats["acceptedOrderOnTimeShare"], 1.0)
+
+    def test_booking_model_is_evaluated_on_a_different_seed_than_it_trains_on(self):
+        def row(seed, slack, booked):
+            return {"seed": seed, "bookingRows": [{
+                "roadKm": 100, "slackMinutes": slack, "leadMinutes": 600,
+                "priceCents": 10000, "referenceFeeCents": 7000, "backlogAtWin": 1,
+                "nearbyDriverHomes": 10, "forecastRisk": 0, "legs": 1, "private": False,
+                "premium": False, "electric": False, "manual": False, "plates": False,
+                "summerTyres": False, "pickupPlaceId": "yard", "deliveryPlaceId": "town",
+                "dealerId": "dealer", "option": "next_day", "townPFailAtWin": 0.25,
+                "cancelled": False, "bookedBeforeWarning": booked,
+            }]}
+        result = validate_by_seed([row("v-a", 720, True), row("v-b", 180, False)])
+        self.assertEqual(result["folds"], 2)
+        self.assertEqual(result["model"]["n"], 2)
+        self.assertIsNotNone(result["model"]["brier"])
+        # A fitted model also returns a bounded prediction for unseen categories.
+        model = PartialPoolingLogistic().fit(row("v-a", 720, True)["bookingRows"])
+        prediction = model.predict_failure(row("v-b", 180, False)["bookingRows"][0])
+        self.assertGreaterEqual(prediction, 0.0)
+        self.assertLessEqual(prediction, 1.0)
 
     def test_runner_checkpoints_rows_and_enables_telemetry(self):
         class Api:

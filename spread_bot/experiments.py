@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Iterable, Optional
 
+from .booking_model import validate_by_seed
 from .desk import play_practice
 from .policy_v4 import PolicyV4
 
@@ -71,6 +72,27 @@ def booking_calibration(values: Iterable[dict]) -> dict:
     }
 
 
+def offer_effectiveness(values: Iterable[dict]) -> dict:
+    """Descriptive direct-offer outcomes, without assigning app bookings to an offer.
+
+    An accepted answer is observable.  A later gig booking is not necessarily caused by the offer,
+    because the same gig remains visible in the app, so it is intentionally not treated as an
+    acceptance proxy here.
+    """
+    rows = [row for value in values for row in (value.get("offerRows") or [])]
+    answered = [row for row in rows if row.get("answer") is not None]
+    accepted = [row for row in answered if row["answer"] == "accepted"]
+    completed = [outcome for row in accepted for outcome in row.get("orderOutcomes", {}).values()
+                 if outcome.get("onTime") is not None]
+    return {
+        "sent": len(rows), "answered": len(answered), "accepted": len(accepted),
+        "answerRate": (len(answered) / len(rows)) if rows else None,
+        "acceptanceRate": (len(accepted) / len(answered)) if answered else None,
+        "acceptedOrderOutcomes": len(completed),
+        "acceptedOrderOnTimeShare": (sum(outcome["onTime"] for outcome in completed) / len(completed)) if completed else None,
+    }
+
+
 def summarize(rows: Iterable[dict], floor: float = SELECTION_FLOOR) -> dict:
     """Metrics used to select an experiment, grouped by named configuration."""
     grouped: dict = {}
@@ -93,6 +115,8 @@ def summarize(rows: Iterable[dict], floor: float = SELECTION_FLOOR) -> dict:
             "meanWonOrders": round(statistics.mean(v["wonOrders"] for v in values), 1),
             "eligible": min_on_time >= floor,
             "bookingCalibration": booking_calibration(values),
+            "bookingModelValidation": validate_by_seed(values),
+            "offerEffectiveness": offer_effectiveness(values),
         }
     return summary
 
@@ -155,6 +179,7 @@ def run_experiments(api, seeds: list[str], level: int, names: list[str], output:
                 "params": params, "marginCents": score["marginCents"], "onTimeShare": score["onTimeShare"],
                 "wonOrders": score["wonOrders"], "ranked": score["ranked"], "undeliveredShare": score["undeliveredShare"],
                 "policyStats": desk.policy.stats, "bookingRows": desk.policy.booking_training_rows(),
+                "offerRows": desk.policy.offer_training_rows(),
             }
             print(f"{name:<15} {seed:<8} margin €{score['marginCents'] / 100:>8.0f}  "
                   f"{100 * score['onTimeShare']:>5.1f}% on time  {score['wonOrders']:>4} orders", flush=True)

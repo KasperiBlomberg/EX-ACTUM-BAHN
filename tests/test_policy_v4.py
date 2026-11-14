@@ -123,6 +123,32 @@ class PolicyV4Tests(unittest.TestCase):
         self.assertEqual(len(desk.outbox), 1)
         self.assertGreater(desk.outbox[0]["feeCents"], 7000)
 
+    def test_offer_telemetry_keeps_context_response_and_delivery_label(self):
+        p = PolicyV4({"recordTelemetry": True})
+        p.homes = {"yard": 30}
+        p.drivers = {"driver": {"id": "driver", "homePlaceId": "yard", "rating": 5.0,
+                                "completedGigs": 100, "drops": 2, "licence": "manual"}}
+        desk = Desk(Api(), "w", 8, 8 * 60, p)
+        o = order("a", last_pickup=680)
+        desk.orders["a"] = o
+        p.open_orders.add("a")
+        desk.posts["g"] = {"type": "post", "stops": [{"orderId": "a", "leg": 0, "kind": "pickup"}],
+                           "audience": {"experienced": False, "manualLicence": False},
+                           "schedule": [{"at": 480, "feeCents": 7000}]}
+        desk.leg_gigs["a"] = {0: "g"}
+        desk.gig_info["g"] = {"orderId": "a", "orderIds": ["a"], "firstFee": 7000, "cars": 1}
+        p.send_targeted_offers(desk)
+        row = p.offer_training_rows()[0]
+        self.assertEqual(row["appFeeCents"], 7000)
+        self.assertGreater(row["feePremiumCents"], 0)
+        self.assertEqual(row["driverPlaceId"], "yard")
+        p.on_event(desk, {"kind": "offer_answered", "at": 485, "gigId": "g", "driverId": "driver", "answer": "accepted"})
+        p.on_event(desk, {"kind": "gig_booked", "at": 485, "gigId": "g"})
+        p.on_event(desk, {"kind": "delivered", "at": 600, "orderId": "a", "leg": 0})
+        self.assertEqual(row["answer"], "accepted")
+        self.assertEqual(row["gigBookedAt"], 485)
+        self.assertTrue(row["orderOutcomes"]["a"]["onTime"])
+
     def test_booking_a_chain_resolves_each_order(self):
         p = self.policy()
         desk = Desk(Api(), "w", 8, 500, p)
