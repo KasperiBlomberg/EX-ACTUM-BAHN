@@ -99,6 +99,10 @@ class PolicyV4:
         # open car's pickup (or starts within followKm of its delivery), offer them that car
         # directly at followMult x its typical fee.  A no costs nothing: the gig stays in the app.
         "enableFollowOffers": False, "followKm": 30, "followMult": 0.65,
+        # A late order halves its dealer's trust count: costly at 25, nothing at 0-2.  For a
+        # dealer whose count is at most lowTrustMax, a dealer-site car is admitted down to
+        # minSlackLowTrust minutes of slack (0 = off: minSlack for everyone).
+        "minSlackLowTrust": 0, "lowTrustMax": 2,
         "uMin": 1.0, "uMax": 2.3, "minEv": 0, "k": 11, "war": 0.15, "daySd": 0.12, "declineMult": 5,
     }
 
@@ -436,6 +440,15 @@ class PolicyV4:
         future_wins = share * self.params["trustWeekWins"] / 5 * days_left
         return scale * 0.01 * 1.5 * opt["listPriceCents"] * min(headroom, future_wins)
 
+    def min_slack(self, req: dict, priv: bool) -> int:
+        """The least slack at which a request is quoted at all."""
+        p = self.params
+        if priv:
+            return p["minSlackPriv"]
+        if p["minSlackLowTrust"] and self.trust.get(req["dealerId"], 0) <= p["lowTrustMax"]:
+            return min(p["minSlack"], p["minSlackLowTrust"])
+        return p["minSlack"]
+
     def note_decline(self, req: dict, km: float, priv: bool) -> None:
         """Count why no option passed the gates, and how near the request was to passing.
 
@@ -445,7 +458,7 @@ class PolicyV4:
         p = self.params
         slack = max(self.slack_of(req, o) for o in req["options"])
         tradein_priv = len(req["legs"]) > 1 and priv and not p["tradeinPriv"]
-        slack_ok = slack >= (p["minSlackPriv"] if priv else p["minSlack"])
+        slack_ok = slack >= self.min_slack(req, priv)
         if km > p["maxKm"]:
             reason = "maxKm"
         elif tradein_priv:
@@ -478,7 +491,7 @@ class PolicyV4:
             base = 1 - (1 - step(p["riskSlack"], self.slack_of(req, o))) * (1 - step(p["riskKm"], km))
             return 1 - (1 - base) * (1 - self.snow_risk(req, o))
 
-        ok_opts = [o for o in req["options"] if km <= p["maxKm"] and self.slack_of(req, o) >= (p["minSlackPriv"] if priv else p["minSlack"])
+        ok_opts = [o for o in req["options"] if km <= p["maxKm"] and self.slack_of(req, o) >= self.min_slack(req, priv)
                    and not (len(req["legs"]) > 1 and priv and not p["tradeinPriv"])]
         if len(ok_opts) > 1:   # offer a fast option only if it is not much riskier
             min_r = min(structural(o) for o in ok_opts)

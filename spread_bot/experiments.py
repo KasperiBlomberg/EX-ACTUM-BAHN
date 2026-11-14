@@ -44,6 +44,7 @@ EXPERIMENTS = {
     # Acceptance sweep, one gate at a time against lanes_trust.  Private cars keep minSlackPriv.
     "accept_slack330": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "minSlack": 330},
     "accept_slack300": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "minSlack": 300},
+    "low_trust_slack": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "minSlackLowTrust": 240},
     "accept_km600": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0, "maxKm": 600},
     "all": {"separateOptionPricing": True, "enableDealerEffects": True, "enableBundles": True,
             "enableOffers": True, "enableSnow": True},

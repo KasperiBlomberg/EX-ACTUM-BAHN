@@ -415,6 +415,27 @@ class FollowOfferTests(unittest.TestCase):
         self.assertFalse(PolicyV4(PolicyV4.RANKED_DEPLOYMENT).params["enableFollowOffers"])
 
 
+class LowTrustSlackTests(unittest.TestCase):
+    def test_tight_car_is_quoted_only_for_a_dealer_with_little_trust_to_lose(self):
+        install_map()
+        tight = request("tight", "yard", "north")
+        tight["options"][0]["deadline"] = 500 + 120 + 30 + 300        # 300 minutes of slack
+        declined = tight["options"][0]["listPriceCents"] * 5
+        control = PolicyV4(PolicyV4.RANKED_DEPLOYMENT)
+        loose = PolicyV4({**PolicyV4.RANKED_DEPLOYMENT, "minSlackLowTrust": 240})
+        for p in (control, loose):
+            p.homes = {"yard": 30}
+        self.assertEqual(control.quote(None, tight)["next_day"], declined)
+        self.assertLess(loose.quote(None, tight)["next_day"], declined)
+        loose.trust["dealer"] = 3
+        self.assertEqual(loose.quote(None, tight)["next_day"], declined)
+        private = request("priv", "yard", "north")
+        private["legs"][0]["pickup"]["privateAddress"] = True
+        private["legs"][0]["pickup"]["window"] = {"from": 480, "to": 1000}
+        loose.trust["dealer"] = 0
+        self.assertEqual(loose.quote(None, private)["next_day"], declined)   # private cars keep their gate
+
+
 class ExperimentConfigTests(unittest.TestCase):
     def test_return_pairs_are_off_by_default_and_differ_from_the_control_by_one_switch(self):
         self.assertFalse(PolicyV4(PolicyV4.RANKED_DEPLOYMENT).params["enableReturnPairs"])
