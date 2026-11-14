@@ -52,9 +52,10 @@ def report(label: str, s: dict) -> None:
 
 
 def make_policy(args):
-    # Ranked/final runs use G, the conservative validated control.  Experimental mechanisms are
-    # opt-in through --params after their own paired practice test clears the safety floor.
-    return None if args.starter else PolicyV4({**PolicyV4.SAFE_DEPLOYMENT, **args.params})
+    # Ranked/final runs use G, the conservative validated control, plus the additions promoted in
+    # PolicyV4.RANKED_DEPLOYMENT.  Other mechanisms are opt-in through --params until their own
+    # paired practice test clears the safety floor; '{"trustBonus":0,"laneScale":0}' gives plain G.
+    return None if args.starter else PolicyV4({**PolicyV4.RANKED_DEPLOYMENT, **args.params})
 
 
 # several seeds in parallel (max 8 practice slots): --seeds v-1,v-2,... prints one line per seed and the total
@@ -201,7 +202,7 @@ def main() -> None:
     ap.add_argument("--board", action="store_true", help="play your next ranking run; it counts")
     ap.add_argument("--final", action="store_true", help="play your copy of the final")
     ap.add_argument("--params", type=json.loads, default={}, help='JSON overrides, e.g. \'{"backlogB":12,"maxKm":550}\'')
-    ap.add_argument("--experiment", help="named ablation: baseline_g, option_prices, dealer_effects, chains, direct_offers, snow, all, or suite; requires --seeds")
+    ap.add_argument("--experiment", help="named ablation: baseline_g, option_prices, dealer_effects, chains, direct_offers, snow, lanes, trust_bonus, lanes_trust, all, or suite; requires --seeds")
     ap.add_argument("--experiment-output", default="experiment-report.json", help="JSON report written by --experiment")
     ap.add_argument("--experiment-workers", type=int, default=1, help="simultaneous practice worlds for --experiment (default: 1, max: free slots)")
     ap.add_argument("--state", default="spread-state.json", help="where the final saves what it has learnt")

@@ -43,6 +43,7 @@ The bot already does the first three. It uses about **1,100 requests a week** (v
 | `spread_bot/policy_v2.py` | Bayesian competitor model, v2 policy |
 | `spread_bot/policy_v4.py` | **the policy the bot plays** |
 | `spread_bot/experiments.py` | named common-seed ablations and JSON reports |
+| `spread_bot/lane_fit.py` | offline fit of the competitor's lasting lane factors from practice reveals → `lanes.json` |
 | `spread_bot/__main__.py` | CLI, sweeps, the final loop |
 | `TODO.md` | staged optimization roadmap and acceptance criteria |
 | `tests/test_notes.py` | 43 note cases: `python3 tests/test_notes.py` |

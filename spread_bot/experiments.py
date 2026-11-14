@@ -30,6 +30,10 @@ EXPERIMENTS = {
     "chains": {**G_CONTROL, "enableBundles": True},
     "direct_offers": {**G_CONTROL, "enableOffers": True},
     "snow": {**G_CONTROL, "enableSnow": True},
+    # Quote-side additions of 14 Nov: the offline lane table and the dealer-trust investment.
+    "lanes": {**G_CONTROL, "laneScale": 1.0},
+    "trust_bonus": {**G_CONTROL, "trustBonus": 1.0},
+    "lanes_trust": {**G_CONTROL, "laneScale": 1.0, "trustBonus": 1.0},
     "all": {"separateOptionPricing": True, "enableDealerEffects": True, "enableBundles": True,
             "enableOffers": True, "enableSnow": True},
 }

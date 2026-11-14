@@ -3,13 +3,20 @@ the roster) priced into quotes and opening fees + a global lateness shadow price
 escalation. This is the policy the bot plays."""
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Optional
 
 from .desk import DAY, INF, round_half_up, steep
 from .geo import P, hav, road
 from .notes import parse_note
 from .policy_v2 import CompModel, eff_deadline, leg_minutes, make_grid
+
+
+def load_lanes() -> dict:
+    """The competitor's lasting lane factors (log price), fitted by ``lane_fit.py``."""
+    return json.loads(Path(__file__).with_name("lanes.json").read_text())
 
 
 class PolicyV4:
@@ -24,6 +31,11 @@ class PolicyV4:
         "enableOffers": False,
         "enableSnow": False,
     }
+    # What the CLI plays: the G control plus every addition that has cleared its paired ablation.
+    # trustBonus: six seeds, mean +EUR 326 a week against G, worst on time 95.1% (14 Nov 2026).
+    # laneScale on top of it: the same six seeds, mean +EUR 761 a week against G (+EUR 435 against
+    # the trust bonus alone), five of six seeds up, worst on time 94.4%.
+    RANKED_DEPLOYMENT = {**SAFE_DEPLOYMENT, "trustBonus": 1.0, "laneScale": 1.0}
     DEFAULTS = {
         # G beat F on every unseen v-9...v-15 seed.  The structural-risk price and hard brake
         # remain the guardrail, so this expands only the cars whose expected risk pays for it.
@@ -54,6 +66,14 @@ class PolicyV4:
         # baseline on exactly the same worlds.
         "separateOptionPricing": True, "enableDealerEffects": True, "enableBundles": True,
         "enableOffers": True, "enableSnow": True, "recordTelemetry": False,
+        # Level-8 dealer trust is an investment: every on-time order lets that dealer accept 1%
+        # more (to 25).  trustBonus scales the estimated future value of one more order into the
+        # quote's expected value; 0 keeps the myopic G quote.  trustWeekWins is a typical week.
+        "trustBonus": 0.0, "trustWeekWins": 300,
+        # The competitor's price has a lane part that is almost the same in every world (dear
+        # where few drivers live near the delivery).  laneScale applies the table fitted from our
+        # practice reveals as a known offset; the live model then learns only what is new.
+        "laneScale": 0.0,
         "uMin": 1.0, "uMax": 2.3, "minEv": 0, "k": 11, "war": 0.15, "daySd": 0.12, "declineMult": 5,
     }
 
@@ -78,12 +98,14 @@ class PolicyV4:
         self.drivers: dict = {}      # driver id -> public profile
         self.offered: dict = {}      # gig id -> {driver id: {day, rowId}}; only open direct offers
         self.driver_offers: dict = {}  # driver id -> {day: number sent}, server allows three/day
+        self.dealer_reqs: dict = {}    # dealer -> price requests seen, for the trust investment
         self.booking_rows: dict = {}   # order id -> features at win plus booking/on-time labels
         # One row per direct offer.  These are deliberately observational: a gig can still be
         # booked from the app while an offer is open, so ``gigBookedAt`` is not evidence that the
         # offer caused the booking.  ``answer`` is the clean response label.
         self.offer_rows: list = []
         self.last_position_refresh = -10**9
+        self.lanes = load_lanes() if p["laneScale"] else None
         self.grid = make_grid(p["uMin"], p["uMax"])
         self.stats = {"quoted": 0, "declined": 0, "evNeg": 0}
 
@@ -220,6 +242,7 @@ class PolicyV4:
                 "lateOrders": self.late_orders, "doneOrders": self.done_orders, "openWarned": list(self.open_warned), "openOrders": list(self.open_orders),
                 "snow": self.snow, "bundlePending": self.bundle_pending, "offered": self.offered,
                 "driverOffers": self.driver_offers, "lastPositionRefresh": self.last_position_refresh,
+                "dealerReqs": self.dealer_reqs,
                 "bookingRows": self.booking_rows if self.params["recordTelemetry"] else {},
                 "offerRows": self.offer_rows if self.params["recordTelemetry"] else []}
 
@@ -241,6 +264,7 @@ class PolicyV4:
         self.offered.update(st.get("offered") or {})
         self.driver_offers.update(st.get("driverOffers") or {})
         self.last_position_refresh = st.get("lastPositionRefresh", -10**9)
+        self.dealer_reqs.update(st.get("dealerReqs") or {})
         self.booking_rows.update(st.get("bookingRows") or {})
         self.offer_rows.extend(st.get("offerRows") or [])
 
@@ -331,8 +355,37 @@ class PolicyV4:
             if outcome is not None:
                 outcome.update(labels)
 
+    def lane_offset(self, req: dict) -> float:
+        """Log of how far the competitor's price on this lane sits above its world level."""
+        if not self.lanes:
+            return 0.0
+        leg = req["legs"][0]
+        return self.params["laneScale"] * (self.lanes["pickup"].get(leg["pickup"]["placeId"], 0.0)
+                                           + self.lanes["delivery"].get(leg["delivery"]["placeId"], 0.0))
+
+    def trust_bonus(self, desk, req: dict, opt: dict) -> float:
+        """Future value, in cents, of one more on-time order for this dealer.
+
+        One more counted order lifts the price the dealer accepts by 1% on every later order
+        until the count would have reached 25 anyway.  Orders already under way count as banked;
+        the dealer's share of requests so far sizes the business still to come this week.
+        """
+        scale = self.params["trustBonus"]
+        if not scale:
+            return 0.0
+        dealer = req["dealerId"]
+        under_way = sum(1 for oid in self.open_orders if (desk.orders.get(oid) or {}).get("dealerId") == dealer)
+        headroom = 25 - self.trust.get(dealer, 0) - under_way
+        if headroom <= 0:
+            return 0.0
+        share = (self.dealer_reqs.get(dealer, 0) + 1) / (sum(self.dealer_reqs.values()) + 30)
+        days_left = max(0.0, (5 * DAY - opt["deadline"]) / DAY)
+        future_wins = share * self.params["trustWeekWins"] / 5 * days_left
+        return scale * 0.01 * 1.5 * opt["listPriceCents"] * min(headroom, future_wins)
+
     def quote(self, desk, req: dict) -> dict:
         p = self.params
+        self.dealer_reqs[req["dealerId"]] = self.dealer_reqs.get(req["dealerId"], 0) + 1
         km = max(road(l["pickup"]["placeId"], l["delivery"]["placeId"])["km"] for l in req["legs"])
         priv = any(l["pickup"]["privateAddress"] or l["delivery"]["privateAddress"] for l in req["legs"])
 
@@ -357,6 +410,7 @@ class PolicyV4:
         lam = self.shadow()
         ref = req["referenceFeeCents"]
         town_fail = max(self.p_fail(l["pickup"]["placeId"]) for l in req["legs"])
+        lane = self.lane_offset(req)
         if not p["separateOptionPricing"]:
             # Pre-v5 control: one markup selected from the first eligible option and copied to
             # every option.  Keeping this exact control makes the option-price ablation useful.
@@ -365,20 +419,21 @@ class PolicyV4:
             if ls >= p["hardLate"] and pf > p["hardPFail"]:
                 self.stats["braked"] = self.stats.get("braked", 0) + 1
                 return prices
-            xs = [math.log(u / t) for u in self.grid]
+            xs = [math.log(u / t) - lane for u in self.grid]
             pw = self.comp.p_win(req["arrivedAt"], xs, req["dealerId"])
             f0 = p["f0"] + p["f0Risk"] * pf
+            bonus = self.trust_bonus(desk, req, o)
             best, bu = -1.0, None
             for i, u in enumerate(self.grid):
                 price = u * o["listPriceCents"]
                 cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
-                ev = pw[i] * (price - cost)
+                ev = pw[i] * (price - cost + bonus)
                 if ev > best:
                     best, bu = ev, u
             if best <= p["minEv"] or bu is None:
                 self.stats["evNeg"] += 1
                 return prices
-            x = math.log(bu / t)
+            x = math.log(bu / t) - lane
             for oo in ok_opts:
                 prices[oo["kind"]] = round_half_up(oo["listPriceCents"] * bu / 100) * 100
             self.quoted[req["id"]] = {oo["kind"]: x for oo in ok_opts}
@@ -393,19 +448,20 @@ class PolicyV4:
             if ls >= p["hardLate"] and pf > p["hardPFail"]:
                 continue
             speed = p["speedValue"].get(o["kind"], 0.0)
-            xs = [math.log(u / t) - speed for u in self.grid]
+            xs = [math.log(u / t) - speed - lane for u in self.grid]
             pw = self.comp.p_win(req["arrivedAt"], xs, req["dealerId"])
             f0 = p["f0"] + p["f0Risk"] * pf
+            bonus = self.trust_bonus(desk, req, o)
             best, bu = -1.0, None
             for i, u in enumerate(self.grid):
                 price = u * o["listPriceCents"]
                 cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
-                ev = pw[i] * (price - cost)
+                ev = pw[i] * (price - cost + bonus)
                 if ev > best:
                     best, bu = ev, u
             if best > p["minEv"] and bu is not None:
                 prices[o["kind"]] = round_half_up(o["listPriceCents"] * bu / 100) * 100
-                learnt[o["kind"]] = math.log(bu / t) - speed
+                learnt[o["kind"]] = math.log(bu / t) - speed - lane
                 quoted_any = True
         if not quoted_any:
             if ls >= p["hardLate"]:

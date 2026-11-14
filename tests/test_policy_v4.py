@@ -189,5 +189,33 @@ class PolicyV4Tests(unittest.TestCase):
         self.assertEqual(restored.dealer, m.dealer)
 
 
+    def test_lane_offset_raises_the_quote_on_a_dear_lane(self):
+        base = PolicyV4(PolicyV4.SAFE_DEPLOYMENT)
+        lanes = PolicyV4({**PolicyV4.SAFE_DEPLOYMENT, "laneScale": 1.0})
+        lanes.lanes = {"pickup": {"yard": 0.0}, "delivery": {"north": 0.15}}
+        for p in (base, lanes):
+            p.homes = {"yard": 30}
+        r = request("r1")
+        self.assertEqual(base.lane_offset(r), 0.0)
+        self.assertAlmostEqual(lanes.lane_offset(r), 0.15)
+        self.assertGreater(lanes.quote(None, r)["next_day"], base.quote(None, r)["next_day"])
+        # the live model must learn the price net of the known lane part
+        import math
+        quoted = lanes.quote(None, request("r2"))["next_day"] / 10000
+        self.assertAlmostEqual(lanes.quoted["r2"]["next_day"], math.log(quoted) - 0.15, places=2)
+
+    def test_trust_bonus_lowers_an_early_quote_until_the_dealer_is_at_the_cap(self):
+        desk = type("FakeDesk", (), {"orders": {}})()
+        base = PolicyV4(PolicyV4.SAFE_DEPLOYMENT)
+        invest = PolicyV4({**PolicyV4.SAFE_DEPLOYMENT, "trustBonus": 1.0})
+        for p in (base, invest):
+            p.homes = {"yard": 30}
+        r = request("r1")
+        self.assertLess(invest.quote(desk, r)["next_day"], base.quote(desk, r)["next_day"])
+        invest.trust["dealer"] = 25
+        self.assertEqual(invest.trust_bonus(desk, r, r["options"][0]), 0.0)
+        self.assertEqual(base.trust_bonus(desk, r, r["options"][0]), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
