@@ -44,6 +44,9 @@ class PolicyV4:
         "f1": 1.25, "f1Lead": 420, "f2": 1.5, "f2Lead": 270,
         "costMult": 1.0,                     # fee / ref paid on a smooth booking
         "failRef": 1.0, "failPrice": 0.15,   # extra cost when a car gets no driver before the warning
+        # pf is a ranking of risk, not a calibrated probability: it predicts 15-20% failures where
+        # 1-3% happen.  riskPrice scales it in the quote's cost; 1.0 is the pre-15-Nov behaviour.
+        "riskPrice": 1.0,
         "priorW": 4,
         "targetLate": 0.06, "shadowK": 25,
         # unbooked for 4 h counts as a failure; own unbooked gigs in a town raise its risk
@@ -426,7 +429,7 @@ class PolicyV4:
             best, bu = -1.0, None
             for i, u in enumerate(self.grid):
                 price = u * o["listPriceCents"]
-                cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
+                cost = p["costMult"] * f0 * ref + p["riskPrice"] * pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
                 ev = pw[i] * (price - cost + bonus)
                 if ev > best:
                     best, bu = ev, u
@@ -455,7 +458,7 @@ class PolicyV4:
             best, bu = -1.0, None
             for i, u in enumerate(self.grid):
                 price = u * o["listPriceCents"]
-                cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
+                cost = p["costMult"] * f0 * ref + p["riskPrice"] * pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
                 ev = pw[i] * (price - cost + bonus)
                 if ev > best:
                     best, bu = ev, u
