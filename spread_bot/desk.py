@@ -11,7 +11,9 @@ behind a policy. A policy is any object with some of these methods; `None` plays
 from __future__ import annotations
 
 import math
+import json
 import re
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .geo import road
@@ -357,12 +359,50 @@ def window_from_note(note: Optional[dict], window: dict, stop: str) -> dict:
 
 
 # ------------------------------------------------------------ practice loop
-def play_practice(api, world_id: str, level: int, policy: Any, keep_events: bool = False):
+def play_practice(api, world_id: str, level: int, policy: Any, keep_events: bool = False,
+                  resume: bool = False, state_path: Optional[str] = None):
+    """Play a practice world, optionally rebuilding policy state after an interruption.
+
+    ``resume`` is intentionally explicit: a new world starts with a blank policy, whereas an
+    interrupted world must replay its server history before it can safely make another decision.
+    """
+    saved = None
+    if resume and state_path:
+        try:
+            saved = json.loads(Path(state_path).read_text())
+            if saved.get("worldId") != world_id:
+                saved = None
+        except (OSError, ValueError):
+            pass
     snap = api.snapshot(world_id)
     desk = Desk(api, world_id, level, snap["now"], policy)
     init = desk.hook("init")
     if init:
         init(desk)
+    after = -1
+    if resume:
+        history = api.events(world_id, -1)
+        if saved and hasattr(policy, "set_state"):
+            policy.set_state(saved["policy"])
+            after = saved.get("after", -1)
+            # Desk state always comes from the authoritative snapshot.  Only replay policy
+            # events that happened after the checkpoint; replaying all history after every
+            # interrupted terminal slice is both slow and would double-count observations.
+            desk.rejoin(snap, history, False)
+            on_event = desk.hook("on_event")
+            if on_event:
+                for event in history:
+                    if event["seq"] > after:
+                        on_event(desk, event, False)
+            after = max([after, *(event["seq"] for event in history)])
+        else:
+            desk.rejoin(snap, history, True)
+            after = max((event["seq"] for event in history), default=-1)
+
+    def checkpoint() -> None:
+        if state_path and hasattr(policy, "get_state"):
+            Path(state_path).write_text(json.dumps({"worldId": world_id, "after": after,
+                                                     "policy": policy.get_state()}))
     ends_at = snap["endsAt"]
     events: list = []
     while desk.now < ends_at:
@@ -382,11 +422,14 @@ def play_practice(api, world_id: str, level: int, policy: Any, keep_events: bool
             desk.read_results(body["actions"], step["results"])
         desk.now = step["now"]
         for e in step["events"]:
+            after = max(after, e["seq"])
             if keep_events:
                 events.append(e)
             desk.handle(e)
         tick = desk.hook("tick")
         if tick:
             tick(desk)
+        checkpoint()
     score = api.score(world_id)
+    checkpoint()
     return desk, score, events
