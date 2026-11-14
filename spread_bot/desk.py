@@ -14,10 +14,27 @@ import math
 import re
 from typing import Any, Callable, Optional
 
+from .geo import road
+
 HOUR, DAY = 60, 1440
 INF = float("inf")
-WAKE_ON = ["price_request", "order_won", "order_changed", "order_cancelled", "visit_failed", "gig_expired", "deadline_close"]
+WAKE_ON = ["price_request", "order_won", "order_changed", "order_cancelled", "visit_failed", "gig_expired",
+           "deadline_close", "gig_dropped", "no_show"]
 NO_RETRY = {"pickupFrom": 0, "manualLicence": False, "plates": False}
+
+
+def planned_drive_minutes(order: dict, legs: list) -> int:
+    """Drive time for a combined gig, including transfers between cars."""
+    total = 0
+    previous_delivery = None
+    for index in legs:
+        leg = order["legs"][index]
+        pickup, delivery = leg["pickup"]["placeId"], leg["delivery"]["placeId"]
+        if previous_delivery is not None:
+            total += road(previous_delivery, pickup)["minutes"]
+        total += road(pickup, delivery)["minutes"]
+        previous_delivery = delivery
+    return total
 
 
 class Desk:
@@ -153,7 +170,9 @@ class Desk:
         if not order:
             return
         self.urgent.add(order_id)
-        self.send_post_of(order_id)
+        for action in self.outbox:
+            if action["type"] == "post" and any(s["orderId"] == order_id for s in action["stops"]):
+                action["schedule"] = self.fees_for(order, pickups(action))
         for gig_id in self.gigs_of(order_id):
             if gig_id not in self.booked:
                 self.outbox.append({"type": "reprice", "gigId": gig_id, "schedule": self.fees_for(order, pickups(self.posts[gig_id]))})
@@ -191,13 +210,13 @@ class Desk:
         churn = len([t for t in self.reposts.get(order["id"], []) if t > self.now - 120])
         if churn >= 3:
             stops = without_windows(stops, INF)   # the windows keep expiring: post without them
-        self.outbox.append({"type": "post", "stops": stops, "audience": audience, "schedule": self.fees_for(order, len(legs))})
-        if len(legs) == 1:
-            return
-        self.send()
-        if not self.gigs_of(order["id"]):
+        if len(legs) > 1 and planned_drive_minutes(order, legs) > 12 * HOUR:
+            # The server rejects combined gigs over 12 hours. Split them before submission so
+            # the practice loop can keep every valid action in its next advance request.
             for leg in legs:
                 self.post(order, [leg], retry)
+            return
+        self.outbox.append({"type": "post", "stops": stops, "audience": audience, "schedule": self.fees_for(order, len(legs))})
 
     def gigs_of(self, order_id: str) -> list:
         return list(dict.fromkeys(self.leg_gigs.get(order_id, {}).values()))
@@ -211,18 +230,19 @@ class Desk:
                                      "firstFee": action["schedule"][0]["feeCents"], "cars": pickups(action)}
 
     def withdraw(self, order_id: str) -> bool:
-        self.send_post_of(order_id)
         gigs = self.gigs_of(order_id)
         if any(g in self.booked for g in gigs):
             return False
+        self.discard_pending_posts(order_id)
         self.leg_gigs.pop(order_id, None)
         for g in gigs:
             self.outbox.append({"type": "withdraw", "gigId": g})
         return True
 
-    def send_post_of(self, order_id: str) -> None:
-        if any(a["type"] == "post" and a["stops"][0]["orderId"] == order_id for a in self.outbox):
-            self.send()
+    def discard_pending_posts(self, order_id: str) -> None:
+        """Drop not-yet-sent posts before replacing an order's plan."""
+        self.outbox = [a for a in self.outbox if not (
+            a["type"] == "post" and any(s["orderId"] == order_id for s in a["stops"]))]
 
     def send(self) -> None:
         actions, self.outbox = self.outbox, []
@@ -346,7 +366,6 @@ def play_practice(api, world_id: str, level: int, policy: Any, keep_events: bool
     ends_at = snap["endsAt"]
     events: list = []
     while desk.now < ends_at:
-        midnight = (desk.now // DAY + 1) * DAY
         if len(desk.outbox) > 50:   # the advance carries at most 50 actions: send the earlier ones first
             keep, desk.outbox = desk.outbox[-50:], desk.outbox[:-50]
             desk.send()
@@ -354,7 +373,8 @@ def play_practice(api, world_id: str, level: int, policy: Any, keep_events: bool
         actions, desk.outbox = desk.outbox, []
         next_wake = desk.hook("next_wake")
         wake = next_wake(desk) if next_wake else INF
-        body: dict = {"untilEvent": getattr(policy, "wake_on", None) or WAKE_ON, "max": int(min(ends_at, midnight, max(desk.now + 1, wake)))}
+        body: dict = {"untilEvent": getattr(policy, "wake_on", None) or WAKE_ON,
+                      "max": int(min(ends_at, max(desk.now + 1, wake)))}
         if actions:
             body["actions"] = actions
         step = api.advance(world_id, body)

@@ -203,3 +203,20 @@ Porting notes: Python's `re` has no `\p{L}`, so `notes.py` builds the letter cla
 `maxKm 450`, `minSlack 360`, `minSlackPriv 600`, `f0 0.92`, `f0Risk 0.30`, `f1 1.25 @ lastPickup−420`, `f2 1.5 @ lastPickup−270`, `failRef 1.0`, `failPrice 0.15`, `targetLate 0.06`, `shadowK 25`, `earlyFail 240`, `backlogB 10`, `warnW 0.4`, `pendW 0.15`, `hardLate 0.075`, `hardPFail 0.15`, `riskSlack [[480,.20],[720,.07],[∞,.02]]`, `riskKm [[200,0],[300,.04],[∞,.14]]`, `optRiskGap 0.08`, competitor model `k 11`, `war 0.15`, `daySd 0.12`, level grid 1.05–1.95, day grid −0.40…+0.35, `temper 0.8`.
 
 G = F + `{"backlogB":12,"maxKm":550}`.
+
+## 10. Option-specific quote experiment (14 Nov)
+
+`spread_bot/policy_v4.py` now optimizes each acceptable delivery option separately. Its expected-value calculation uses that option's own structural lateness risk, and the competitor model learns from the option selected on a win. On a loss, it uses the most competitive option offered. `fastPremium` controls any extra relative same-day price.
+
+Same level 8 seed `v-9`, four runs:
+
+| Policy | `fastPremium` | Margin | Orders | On time | Ranked |
+|---|---:|---:|---:|---:|---|
+| Original F | — | €9,832.25 | 305 | 94.1% | yes |
+| Per-option risk | 0% | **€10,146.26** | 302 | **94.4%** | yes |
+| Per-option risk | 5% | €9,977.67 | 303 | 93.4% | yes |
+| Per-option risk | 10% | €9,727.54 | 297 | 92.6% | yes |
+
+The new calculation with no same-day premium beat original F by €314.01 and 0.3 percentage points on this seed. Increasing the premium reduced both margin and on-time share, so the default is `fastPremium: 0.0`. This is a promising one-seed result, not enough to establish a general improvement; compare on more unseen seeds before replacing F for a final.
+
+The team's eight practice slots were occupied by regular, non-ranking worlds. With the user's authorization, the least advanced one was deleted; no ranking run was touched. Network access then worked and all four runs finished ranked.

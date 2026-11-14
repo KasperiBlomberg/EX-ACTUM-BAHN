@@ -1,7 +1,7 @@
 """Entry point (port of src/main.js). Python 3.9+, no dependencies.
 
   python -m spread_bot --level 8 --seed v-1                   # one practice week
-  python -m spread_bot --seeds v-1,v-2,v-3                    # several weeks in parallel + total
+  python -m spread_bot --seeds v-1,v-2,v-3                    # several weeks in sequence + total
   python -m spread_bot --seed v-1 --params '{"backlogB":12}'  # override settings
   python -m spread_bot --level 8 --board                      # next ranking run (it counts!)
   caffeinate -i python -m spread_bot --final                  # test final / final: waits, then plays
@@ -16,7 +16,6 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -55,16 +54,18 @@ def make_policy(args):
     return None if args.starter else PolicyV4(args.params)
 
 
-# several seeds in parallel (max 8 practice slots): --seeds v-1,v-2,... prints one line per seed and the total
+# several seeds in sequence: the team's shared request budget makes parallel weeks no faster
 def sweep_seeds(api: Api, seeds: list, level: int, args) -> None:
     out: list = []
 
     def one(seed: str) -> None:
+        calls_before = api.calls
         w = api.create(level, seed)
         try:
             desk, score, _ = play_practice(api, w["worldId"], level, make_policy(args))
             out.append({"seed": seed, "score": score, "stats": getattr(desk.policy, "stats", None)})
-            print(f"{seed:<8} margin €{score['marginCents'] / 100:>7.0f}  {score['wonOrders']:>4} orders  {100 * score['onTimeShare']:.1f}% on time", flush=True)
+            print(f"{seed:<8} margin €{score['marginCents'] / 100:>7.0f}  {score['wonOrders']:>4} orders  "
+                  f"{100 * score['onTimeShare']:.1f}% on time  {api.calls - calls_before} requests", flush=True)
         except Exception as e:
             print(seed, repr(e), file=sys.stderr, flush=True)
             try:
@@ -72,8 +73,8 @@ def sweep_seeds(api: Api, seeds: list, level: int, args) -> None:
             except Exception:
                 pass
 
-    with ThreadPoolExecutor(max_workers=min(8, len(seeds))) as pool:
-        list(pool.map(one, seeds))
+    for seed in seeds:
+        one(seed)
     if not out:
         return
     tot = sum(r["score"]["marginCents"] for r in out) / 100
@@ -84,6 +85,7 @@ def sweep_seeds(api: Api, seeds: list, level: int, args) -> None:
 def practice(api: Api, args) -> None:
     if args.seeds:
         return sweep_seeds(api, args.seeds.split(","), args.level, args)
+    calls_before = api.calls
     w = api.create(args.level, args.seed, args.board)
     print(f"{'Ranking run' if args.board else 'Practice world'} {w['worldId']}, level {args.level}", flush=True)
     try:
@@ -99,6 +101,7 @@ def practice(api: Api, args) -> None:
         raise
     report("End", score)
     print("Ranked." if score["ranked"] else "Not ranked.")
+    print(f"API requests for this world: {api.calls - calls_before}")
 
 
 # ---------------------------------------------------------------- the final: poll events, act at once
@@ -187,7 +190,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Plays a Spread world with the v4 policy. Set SPREAD_URL and SPREAD_KEY (or a .env file).")
     ap.add_argument("--level", type=int, default=8, choices=range(1, 9))
     ap.add_argument("--seed", help="any text; the same seed gives the same world")
-    ap.add_argument("--seeds", help="comma-separated seeds to play in parallel (at most 8 at once)")
+    ap.add_argument("--seeds", help="comma-separated seeds to play in sequence")
     ap.add_argument("--board", action="store_true", help="play your next ranking run; it counts")
     ap.add_argument("--final", action="store_true", help="play your copy of the final")
     ap.add_argument("--params", type=json.loads, default={}, help='JSON overrides, e.g. \'{"backlogB":12,"maxKm":550}\'')

@@ -10,7 +10,7 @@ Put the team key in `.env` (`SPREAD_KEY=...`; the file is gitignored) or export 
 
 ```sh
 python3 -m spread_bot --level 8 --seed v-1                        # one practice week
-python3 -m spread_bot --seeds v-9,v-10,v-11,v-12,v-13,v-14,v-15,v-16   # 8 weeks in parallel + total
+python3 -m spread_bot --seeds v-9,v-10,v-11,v-12,v-13,v-14,v-15,v-16   # 8 weeks in sequence + total
 python3 -m spread_bot --seeds v-1,v-2 --params '{"backlogB":12,"maxKm":550}'   # override settings (here: G)
 python3 -m spread_bot --level 8 --board                           # next ranking run (it counts!)
 caffeinate -i python3 -m spread_bot --final                       # test final / final: waits, then plays
@@ -34,13 +34,13 @@ python3 -m spread_bot --seed v-1 --starter                        # the kit star
 
 `docs/` holds the challenge handbook, rules, API reference and the official Python kit. The OPTIMIZATION_LOG mentions `src/*.js` and `tools/` in places: those are the JS files the Python modules were ported from, same names.
 
-## Default (setting set F) on level 8 seeds v-1…v-8
-Average **+€11.2k per week**. Worst on-time share 95.3%, and all eight weeks ranked. The starter loses €72.6k on spread-1.
+## Previous F baseline on level 8 seeds v-1…v-8
+Average **+€11.2k per week**. Worst on-time share 95.3%, and all eight weeks ranked. The starter loses €72.6k on spread-1. The current policy adds per-option risk pricing; on the first comparison seed, v-9, it improved margin by €314 and on-time share by 0.3 percentage points over F. That is a one-seed result; see `OPTIMIZATION_LOG.md` before treating it as validated.
 
 ## How it decides (short version)
 
 1. **Which cars to take.** Distance and slack are hard limits (450 km, 6 hours). Slack comes from the deadline, the dealer's note, the site hours and the drive time.
 2. **Risk of no driver.** Per pickup town, learnt live, with a prior from the roster. The bot's own unbooked backlog in the town adds to it, as do structural risks from short slack and long distance.
-3. **The price.** A Bayesian competitor model per world and per day, with a price-war prior and dealer trust. The bot quotes the price that maximises P(win) × (price − fee − risk cost × lateness shadow price). Slower options are offered only when the fast option is much riskier.
+3. **The price.** A Bayesian competitor model per world and per day, with a price-war prior and dealer trust. Each acceptable delivery option gets its own risk-adjusted price that maximises P(win) × (price − fee − risk cost × lateness shadow price). The same-day premium defaults to zero and can be tuned separately. Slower options are offered only when the fast option is much riskier.
 4. **Fees.** Flat (0.92 + 0.30 × risk) × the typical fee, then 1.25× at 7 hours and 1.5× at 4.5 hours before the last safe pickup. The fee goes up at once after a drop, and to the steep schedule after the deadline warning.
 5. **Notes.** They set the stop windows, plates and the manual-licence audience.

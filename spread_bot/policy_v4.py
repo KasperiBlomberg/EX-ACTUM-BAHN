@@ -25,6 +25,7 @@ class PolicyV4:
         "earlyFail": 240, "backlogB": 10, "warnW": 0.4, "pendW": 0.15, "hardLate": 0.075, "hardPFail": 0.15,
         # structural risk by slack and distance
         "riskSlack": [[480, 0.20], [720, 0.07], [1e9, 0.02]], "riskKm": [[200, 0], [300, 0.04], [1e9, 0.14]], "optRiskGap": 0.08,
+        "fastPremium": 0.0,                # tune same-day premium separately; v-9 preferred no premium
         "uMin": 1.0, "uMax": 2.3, "minEv": 0, "k": 11, "war": 0.15, "daySd": 0.12, "declineMult": 5,
     }
 
@@ -32,7 +33,7 @@ class PolicyV4:
         p = self.params = {**self.DEFAULTS, **(params or {})}
         self.comp = CompModel(k=p["k"], war=p["war"], daySd=p["daySd"])
         self.trust: dict = {}        # dealer -> on-time count (0..25)
-        self.quoted: dict = {}       # request id -> x (log price/list, trust-adjusted)
+        self.quoted: dict = {}       # request id -> option -> x (legacy states may hold one float)
         self.town: dict = {}         # pickup place -> {ok, fail}
         self.order_town: dict = {}   # order -> pickup place
         self.resolved: dict = {}     # order -> 'ok' | 'fail'
@@ -194,30 +195,39 @@ class PolicyV4:
         if not ok_opts:
             self.stats["declined"] += 1
             return prices
-        o, ref = ok_opts[0], req["referenceFeeCents"]
-        lst = o["listPriceCents"]
+        ref = req["referenceFeeCents"]
         t = 1 + 0.01 * self.trust.get(req["dealerId"], 0)
-        pw = self.comp.p_win(req["arrivedAt"], [math.log(u / t) for u in self.grid])
-        pf = 1 - (1 - max(self.p_fail(l["pickup"]["placeId"]) for l in req["legs"])) * (1 - max(structural(o) for o in ok_opts))
+        town_fail = max(self.p_fail(l["pickup"]["placeId"]) for l in req["legs"])
         ls = self.late_share()
-        if ls >= p["hardLate"] and pf > p["hardPFail"]:   # hard brake: only safe cars, which also dilute the late share
-            self.stats["braked"] = self.stats.get("braked", 0) + 1
-            return prices
         lam = self.shadow()
-        f0 = p["f0"] + p["f0Risk"] * pf
-        best, bu = -1, None
-        for i, u in enumerate(self.grid):
-            price = u * lst
-            cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
-            ev = pw[i] * (price - cost)
-            if ev > best:
-                best, bu = ev, u
-        if best <= p["minEv"]:
+        quoted_x = {}
+        for option in ok_opts:
+            pf = 1 - (1 - town_fail) * (1 - structural(option))
+            if ls >= p["hardLate"] and pf > p["hardPFail"]:
+                continue
+            premium = p["fastPremium"] if option["kind"] == "same_day" else 0.0
+            xs = [math.log(u * (1 + premium) / t) for u in self.grid]
+            win_probs = self.comp.p_win(req["arrivedAt"], xs)
+            f0 = p["f0"] + p["f0Risk"] * pf
+            best_ev, best_x = -1, None
+            for u, x, win_prob in zip(self.grid, xs, win_probs):
+                quote_u = u * (1 + premium)
+                price = quote_u * option["listPriceCents"]
+                cost = p["costMult"] * f0 * ref + pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
+                ev = win_prob * (price - cost)
+                if ev > best_ev:
+                    best_ev, best_x = ev, x
+            if best_ev > p["minEv"]:
+                prices[option["kind"]] = round_half_up(option["listPriceCents"] * math.exp(best_x) * t / 100) * 100
+                quoted_x[option["kind"]] = best_x
+            else:
+                prices[option["kind"]] = round_half_up(option["listPriceCents"] * p["declineMult"] / 100) * 100
+        if not quoted_x:
+            if ls >= p["hardLate"]:
+                self.stats["braked"] = self.stats.get("braked", 0) + 1
             self.stats["evNeg"] += 1
             return prices
-        for oo in ok_opts:
-            prices[oo["kind"]] = round_half_up(oo["listPriceCents"] * bu / 100) * 100
-        self.quoted[req["id"]] = math.log(bu / t)
+        self.quoted[req["id"]] = quoted_x
         self.stats["quoted"] += 1
         return prices
 
@@ -229,7 +239,12 @@ class PolicyV4:
             oid = e["order"]["id"]
             if oid in self.quoted:
                 r = desk.requests.get(oid)
-                self.comp.observe(r["arrivedAt"] if r else e["at"], self.quoted.pop(oid), True)
+                quote_x = self.quoted.pop(oid)
+                if isinstance(quote_x, dict):
+                    x = quote_x.get(e["order"].get("option"), min(quote_x.values()))
+                else:  # state files written by the earlier single-price policy
+                    x = quote_x
+                self.comp.observe(r["arrivedAt"] if r else e["at"], x, True)
             self.order_town[oid] = e["order"]["legs"][0]["pickup"]["placeId"]
             self.open_orders.add(oid)
             self.pending[oid] = e["at"]
@@ -237,7 +252,12 @@ class PolicyV4:
         elif kind == "order_lost":
             if e["requestId"] in self.quoted:
                 r = desk.requests.get(e["requestId"])
-                self.comp.observe(r["arrivedAt"] if r else e["at"], self.quoted.pop(e["requestId"]), False)
+                quote_x = self.quoted.pop(e["requestId"])
+                if isinstance(quote_x, dict):
+                    x = min(quote_x.values())  # loss is evidence against the most competitive option we offered
+                else:  # state files written by the earlier single-price policy
+                    x = quote_x
+                self.comp.observe(r["arrivedAt"] if r else e["at"], x, False)
         elif kind == "gig_booked":
             info = desk.gig_info.get(e["gigId"])
             oid = info["orderId"] if info else None
