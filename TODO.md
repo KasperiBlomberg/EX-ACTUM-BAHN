@@ -9,8 +9,8 @@ is proven robust. Never choose a configuration from average margin alone.
 - [x] Keep the known G baseline (`maxKm=550`, `backlogB=12`) as a named configuration.
 - [x] Add named ablations for option pricing, dealer effects, chains, direct offers, and snow.
 - [x] Add a repeatable runner that records one row per seed/configuration and writes a JSON report.
-- [ ] Run baseline and one feature at a time on fresh seeds `v-17...v-32`.
-- [ ] Record mean/median margin, worst on-time share, orders won, and ranking count.
+- [ ] Finish baseline and one-feature paired runs on fresh seeds `v-17...v-32` (paused for the ranked round).
+- [x] Record mean/median margin, worst on-time share, orders won, and ranking count for the completed ablations.
 - [ ] Promote only configurations whose worst seed is at least 93% on time.
 
 ### Pilot note — not enough evidence to select a policy
@@ -42,6 +42,14 @@ Option-specific pricing averaged **€8,671.51**, versus **€9,062.28** for G (
 safe on this sample but is not competitive with the current hand-set speed values. Do not promote
 it; revisit only through the planned speed-value sweep / dealer-choice fit.
 
+### Dealer offsets and chains — interrupted deliberately before the ranked round
+
+Dealer offsets were positive on the two completed paired seeds: `v-18` was **+€160.70** margin
+with 98.6% on time (G: 98.2%), and `v-20` was **+€199.87** with 100.0% on time (G: 99.4%). `v-19`
+was stopped, so this is promising but not promotion evidence. The three chain worlds were stopped
+before completion, so chains have no result. All practice worlds were cleaned up; see
+`HANDOFF.md` for the ranked-round deployment choice and restart commands.
+
 ## 2. Tune existing knobs — next
 
 Use common seeds for every candidate. Search small related groups, not every parameter at once.
@@ -51,6 +59,12 @@ Use common seeds for every candidate. Search small related groups, not every par
 - [ ] Chain sweep: hold time, minimum lead, maximum cars, marginal-car fee share.
 - [ ] Fee sweep: opening fee/risk uplift and both escalation times.
 - [ ] Use a constrained objective: discard candidates below the on-time floor, then rank by mean margin.
+
+### Ranked-round deployment choice
+
+- [x] Make normal CLI and `--final` runs use the validated G control by default.
+- [x] Keep option prices, dealer offsets, chains, direct offers and snow opt-in pending their own ablation.
+- [ ] After the ranked round, finish dealer-offset and chain validation before enabling either.
 
 ## 3. Calibrate booking risk — highest-value model work
 
