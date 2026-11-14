@@ -202,7 +202,8 @@ def main() -> None:
     ap.add_argument("--board", action="store_true", help="play your next ranking run; it counts")
     ap.add_argument("--final", action="store_true", help="play your copy of the final")
     ap.add_argument("--params", type=json.loads, default={}, help='JSON overrides, e.g. \'{"backlogB":12,"maxKm":550}\'')
-    ap.add_argument("--experiment", help="named ablation: baseline_g, option_prices, dealer_effects, chains, direct_offers, snow, lanes, trust_bonus, lanes_trust, all, or suite; requires --seeds")
+    ap.add_argument("--experiment", help="named ablation: baseline_g, option_prices, dealer_effects, chains, direct_offers, snow, lanes, trust_bonus, lanes_trust, return_pairs, return_pairs_fee_only, accept_slack330, accept_slack300, accept_km600, all, or suite; "
+                    "several with commas (the first is the control of the paired comparison); requires --seeds")
     ap.add_argument("--experiment-output", default="experiment-report.json", help="JSON report written by --experiment")
     ap.add_argument("--experiment-workers", type=int, default=1, help="simultaneous practice worlds for --experiment (default: 1, max: free slots)")
     ap.add_argument("--state", default="spread-state.json", help="where the final saves what it has learnt")
@@ -222,9 +223,9 @@ def main() -> None:
         if not args.seeds:
             sys.exit("--experiment requires --seeds, for example --seeds v-17,v-18,v-19,v-20")
         from .experiments import EXPERIMENTS, run_experiments
-        if args.experiment not in EXPERIMENTS and args.experiment != "suite":
+        names = list(EXPERIMENTS) if args.experiment == "suite" else args.experiment.split(",")
+        if any(name not in EXPERIMENTS for name in names):
             sys.exit("Unknown --experiment. Choose: " + ", ".join(EXPERIMENTS))
-        names = list(EXPERIMENTS) if args.experiment == "suite" else [args.experiment]
         run_experiments(api, args.seeds.split(","), args.level, names, args.experiment_output, args.params, args.experiment_workers)
         return
     if args.final:

@@ -12,6 +12,7 @@ from .desk import DAY, INF, round_half_up, steep
 from .geo import P, hav, road
 from .notes import parse_note
 from .policy_v2 import CompModel, eff_deadline, leg_minutes, make_grid
+from .return_legs import is_return_leg, job, plan_pair
 
 
 def load_lanes() -> dict:
@@ -30,6 +31,7 @@ class PolicyV4:
         "enableBundles": False,
         "enableOffers": False,
         "enableSnow": False,
+        "enableReturnPairs": False,
     }
     # What the CLI plays: the G control plus every addition that has cleared its paired ablation.
     # trustBonus: six seeds, mean +EUR 326 a week against G, worst on time 95.1% (14 Nov 2026).
@@ -42,6 +44,10 @@ class PolicyV4:
         "maxKm": 550, "minSlack": 360, "minSlackPriv": 600, "tradeinPriv": False,
         "f0": 0.92, "f0Risk": 0.30,          # opening fee = (f0 + f0Risk * pFail_town) * ref
         "f1": 1.25, "f1Lead": 420, "f2": 1.5, "f2Lead": 270,
+        # A car won before its due day and still unbooked at 13:00 on that day is late four times
+        # in five; one booked by midnight almost never is.  Drivers plan a day the evening before
+        # and early in the morning, so the fee rises then (minute of the day; fEve 0 = off).
+        "eveAt": 1020, "fEve": 0.0, "mornAt": 360, "fMorn": 0.0,
         "costMult": 1.0,                     # fee / ref paid on a smooth booking
         "failRef": 1.0, "failPrice": 0.15,   # extra cost when a car gets no driver before the warning
         # pf is a ranking of risk, not a calibrated probability: it predicts 15-20% failures where
@@ -77,6 +83,22 @@ class PolicyV4:
         # where few drivers live near the delivery).  laneScale applies the table fitted from our
         # practice reveals as a known offset; the live model then learns only what is new.
         "laneScale": 0.0,
+        # Return-leg pairs: an ordinary single car with at least pairMinLead + pairHold minutes
+        # to its last pickup is held up to pairHold minutes for an order going back the other
+        # way (both ends within pairKm).  The pair is one gig at pairFee x the two typical fees
+        # (a round trip costs a driver about one one-way gig); unbooked after pairPostWait
+        # minutes it is withdrawn and both cars are posted singly.  With pairQuote, a request
+        # that completes a held order is quoted at its marginal fee, weighted by pairBookProb
+        # and never under pairMinMarginal x its typical fee.  Off until its ablation clears.
+        "enableReturnPairs": False, "pairQuote": True, "pairHold": 60, "pairPostWait": 60,
+        "pairKm": 30, "pairMinLead": 540, "pairMaxWait": 90, "pairFee": 0.62,
+        "pairBookProb": 0.7, "pairMinMarginal": 0.35,
+        # Follow-on offers: 17% of our bookings go to a driver who already holds another gig of
+        # ours ending near the pickup, at the full fee, though the second gig costs that driver
+        # only the extra time.  When a driver holds a booking that ends within followKm of an
+        # open car's pickup (or starts within followKm of its delivery), offer them that car
+        # directly at followMult x its typical fee.  A no costs nothing: the gig stays in the app.
+        "enableFollowOffers": False, "followKm": 30, "followMult": 0.65,
         "uMin": 1.0, "uMax": 2.3, "minEv": 0, "k": 11, "war": 0.15, "daySd": 0.12, "declineMult": 5,
     }
 
@@ -111,6 +133,26 @@ class PolicyV4:
         self.lanes = load_lanes() if p["laneScale"] else None
         self.grid = make_grid(p["uMin"], p["uMax"])
         self.stats = {"quoted": 0, "declined": 0, "evNeg": 0}
+        # Why a request got no real quote, and how far the declined ones were from the gates.
+        self.decline_reasons = {"maxKm": 0, "minSlack": 0, "privateSlack": 0, "privateTradeIn": 0,
+                                "hardLateBrake": 0, "negativeEv": 0}
+        self.decline_near: dict = {}     # band -> {n, listCents}: declined on one gate only
+        self.pair_hold: dict = {}        # order id -> minute since it waits for a return leg
+        self.pair_reserved: dict = {}    # held order id -> {requestId, until}: promised to a quote
+        self.pair_quoted: dict = {}      # request id -> {partner, alone}: quoted at the marginal fee
+        self.pairs: dict = {}            # "a|b" -> one telemetry row per posted pair
+        self.pair_of: dict = {}          # order id -> key of its live pair
+        self.event_at: Optional[int] = None   # minute of the event being handled, for tick
+        self.driver_jobs: dict = {}      # booked gig id -> {driver, first, last}: where our drivers go
+        self.follow_open: dict = {}      # "gig|driver" -> {fee, appFee}; kept after the answer
+        self.follow_won: set = set()     # gigs booked through a follow-on offer
+        self.follow_last = -1            # minute of the last follow-on pass
+        self.follow_stats = {"sent": 0, "accepted": 0, "declined": 0, "expired": 0, "savingCents": 0, "droppedAfter": 0}
+        self.pair_stats = {"held": 0, "holdReleased": 0, "candidates": 0, "feasible": 0, "posted": 0,
+                           "postFailed": 0, "booked": 0, "dropped": 0, "dissolved": 0, "feeSavingCents": 0,
+                           "quoteCandidates": 0, "quoteFeasible": 0, "quoteDiscounted": 0, "quoteWins": 0,
+                           "quoteWinsOtherwiseDeclined": 0, "quoteDiscountCents": 0,
+                           "rejects": {"driving_limit": 0, "windows": 0, "near_deadline": 0}}
 
     # ------------------------------------------------------------ notes and slack
     def note_of(self, req: dict) -> dict:
@@ -246,6 +288,9 @@ class PolicyV4:
                 "snow": self.snow, "bundlePending": self.bundle_pending, "offered": self.offered,
                 "driverOffers": self.driver_offers, "lastPositionRefresh": self.last_position_refresh,
                 "dealerReqs": self.dealer_reqs,
+                # Held orders are not saved: after a restart Desk.rejoin posts them singly.
+                "pairs": self.pairs, "pairOf": self.pair_of, "pairStats": self.pair_stats,
+                "declineReasons": self.decline_reasons, "declineNear": self.decline_near,
                 "bookingRows": self.booking_rows if self.params["recordTelemetry"] else {},
                 "offerRows": self.offer_rows if self.params["recordTelemetry"] else []}
 
@@ -268,6 +313,11 @@ class PolicyV4:
         self.driver_offers.update(st.get("driverOffers") or {})
         self.last_position_refresh = st.get("lastPositionRefresh", -10**9)
         self.dealer_reqs.update(st.get("dealerReqs") or {})
+        self.pairs.update(st.get("pairs") or {})
+        self.pair_of.update(st.get("pairOf") or {})
+        self.pair_stats.update(st.get("pairStats") or {})
+        self.decline_reasons.update(st.get("declineReasons") or {})
+        self.decline_near.update(st.get("declineNear") or {})
         self.booking_rows.update(st.get("bookingRows") or {})
         self.offer_rows.extend(st.get("offerRows") or [])
 
@@ -386,6 +436,35 @@ class PolicyV4:
         future_wins = share * self.params["trustWeekWins"] / 5 * days_left
         return scale * 0.01 * 1.5 * opt["listPriceCents"] * min(headroom, future_wins)
 
+    def note_decline(self, req: dict, km: float, priv: bool) -> None:
+        """Count why no option passed the gates, and how near the request was to passing.
+
+        The near-miss bands hold only requests that fail one gate, so a band's count is what a
+        looser ``maxKm`` or ``minSlack`` would newly admit (private cars keep their own gate).
+        """
+        p = self.params
+        slack = max(self.slack_of(req, o) for o in req["options"])
+        tradein_priv = len(req["legs"]) > 1 and priv and not p["tradeinPriv"]
+        slack_ok = slack >= (p["minSlackPriv"] if priv else p["minSlack"])
+        if km > p["maxKm"]:
+            reason = "maxKm"
+        elif tradein_priv:
+            reason = "privateTradeIn"
+        elif priv and slack >= p["minSlack"]:
+            reason = "privateSlack"
+        else:
+            reason = "minSlack"
+        self.decline_reasons[reason] += 1
+        band = None
+        if reason == "maxKm" and slack_ok and not tradein_priv:
+            band = next((f"km{lim}" for lim in (600, 650, 700) if km <= lim), "kmOver700")
+        elif reason == "minSlack" and not priv:
+            band = next((f"slack{lim}" for lim in (330, 300, 270, 240) if slack >= lim), "slackUnder240")
+        if band:
+            near = self.decline_near.setdefault(band, {"n": 0, "listCents": 0})
+            near["n"] += 1
+            near["listCents"] += max(o["listPriceCents"] for o in req["options"])
+
     def quote(self, desk, req: dict) -> dict:
         p = self.params
         self.dealer_reqs[req["dealerId"]] = self.dealer_reqs.get(req["dealerId"], 0) + 1
@@ -407,6 +486,7 @@ class PolicyV4:
         prices = {o["kind"]: round_half_up(o["listPriceCents"] * p["declineMult"] / 100) * 100 for o in req["options"]}
         if not ok_opts:
             self.stats["declined"] += 1
+            self.note_decline(req, km, priv)
             return prices
         t = 1 + 0.01 * self.trust.get(req["dealerId"], 0)
         ls = self.late_share()
@@ -421,34 +501,57 @@ class PolicyV4:
             pf = 1 - (1 - town_fail) * (1 - max(structural(oo) for oo in ok_opts))
             if ls >= p["hardLate"] and pf > p["hardPFail"]:
                 self.stats["braked"] = self.stats.get("braked", 0) + 1
+                self.decline_reasons["hardLateBrake"] += 1
                 return prices
             xs = [math.log(u / t) - lane for u in self.grid]
             pw = self.comp.p_win(req["arrivedAt"], xs, req["dealerId"])
             f0 = p["f0"] + p["f0Risk"] * pf
             bonus = self.trust_bonus(desk, req, o)
-            best, bu = -1.0, None
-            for i, u in enumerate(self.grid):
-                price = u * o["listPriceCents"]
-                cost = p["costMult"] * f0 * ref + p["riskPrice"] * pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
-                ev = pw[i] * (price - cost + bonus)
-                if ev > best:
-                    best, bu = ev, u
-            if best <= p["minEv"] or bu is None:
+
+            def best_markup(fee_cost: float):
+                best, bu = -1.0, None
+                for i, u in enumerate(self.grid):
+                    price = u * o["listPriceCents"]
+                    cost = fee_cost + p["riskPrice"] * pf * lam * (p["failRef"] * ref + p["failPrice"] * price)
+                    ev = pw[i] * (price - cost + bonus)
+                    if ev > best:
+                        best, bu = ev, u
+                return (best, bu) if best > p["minEv"] else (best, None)
+
+            best, bu = best_markup(p["costMult"] * f0 * ref)
+            # Only a request that completes a held, safely postable return leg is priced at its
+            # marginal fee; everything else keeps the standalone cost above.
+            pair = self.pair_quote(desk, req, ok_opts, f0)
+            if pair:
+                alone_u = bu
+                best, bu = best_markup(p["costMult"] * pair["feeCost"])
+                if bu is None or (alone_u is not None and bu >= alone_u):
+                    bu, pair = alone_u, None
+            if bu is None:
                 self.stats["evNeg"] += 1
+                self.decline_reasons["negativeEv"] += 1
                 return prices
             x = math.log(bu / t) - lane
             for oo in ok_opts:
                 prices[oo["kind"]] = round_half_up(oo["listPriceCents"] * bu / 100) * 100
+            if pair:
+                self.pair_stats["quoteDiscounted"] += 1
+                self.pair_reserved[pair["partner"]] = {"requestId": req["id"], "until": req["respondBy"] + 1}
+                self.pair_quoted[req["id"]] = {"partner": pair["partner"], "alone": {
+                    oo["kind"]: None if alone_u is None else round_half_up(oo["listPriceCents"] * alone_u / 100) * 100
+                    for oo in ok_opts}}
             self.quoted[req["id"]] = {oo["kind"]: x for oo in ok_opts}
             self.stats["quoted"] += 1
             return prices
         learnt: dict = {}
         quoted_any = False
+        braked = 0
         for o in ok_opts:
             # Each delivery option has its own slack, snow exposure and dealer speed value.  The
             # effective log price is also the correct value to learn from when this option wins.
             pf = 1 - (1 - town_fail) * (1 - structural(o))
             if ls >= p["hardLate"] and pf > p["hardPFail"]:
+                braked += 1
                 continue
             speed = p["speedValue"].get(o["kind"], 0.0)
             xs = [math.log(u / t) - speed - lane for u in self.grid]
@@ -470,6 +573,7 @@ class PolicyV4:
             if ls >= p["hardLate"]:
                 self.stats["braked"] = self.stats.get("braked", 0) + 1
             self.stats["evNeg"] += 1
+            self.decline_reasons["hardLateBrake" if braked == len(ok_opts) else "negativeEv"] += 1
             return prices
         self.quoted[req["id"]] = learnt
         self.stats["quoted"] += 1
@@ -479,6 +583,11 @@ class PolicyV4:
         self.last_now = max(self.last_now, e["at"])
         self.sweep_pending(e["at"])
         kind = e["kind"]
+        self.event_at = None if replay else e["at"]
+        if self.pair_hold or self.pair_of or self.pair_reserved or self.pair_quoted:
+            self.pair_event(desk, e)
+        if self.params["enableFollowOffers"] and not replay:
+            self.follow_event(desk, e)
         if kind == "forecast":
             forecast = {"from": e["from"], "to": e["to"], "places": e["placeIds"]}
             if forecast not in self.snow:
@@ -582,12 +691,24 @@ class PolicyV4:
                     row["deliveredAt"] = e["at"]
                     row["onTime"] = on_time
                 self.label_offer_orders(e["orderId"], deliveredAt=e["at"], onTime=on_time)
+                pair_row = self.pairs.get(self.pair_of.get(e["orderId"]))
+                if pair_row and pair_row["state"] == "booked":
+                    pair_row["onTime"][e["orderId"]] = on_time
                 if not on_time:
                     self.late_orders += 1
 
     # ------------------------------------------------------------ short holding queue and chains
     def queue_order(self, desk, order: dict) -> bool:
         """Hold an ordinary one-car order just long enough to find a same-yard partner."""
+        if self.params["enableReturnPairs"]:
+            try:
+                if self.queue_for_pair(desk, order):
+                    return True
+            except Exception:
+                # Pairing is an optimisation only: on any error the car is posted as usual.
+                self.pair_hold.pop(order["id"], None)
+                if desk.gigs_of(order["id"]) or self.has_post(desk, order["id"]):
+                    return True
         if not self.params["enableBundles"]:
             return False
         if len(order["legs"]) != 1:
@@ -730,11 +851,25 @@ class PolicyV4:
     def tick(self, desk) -> None:
         self.last_now = max(self.last_now, desk.now)
         self.sweep_pending(desk.now)
+        # Desk.handle ticks after every event of a step, with the clock already at the step's
+        # end.  Later events of that step (a booking) are not handled yet, so there a hold is
+        # judged at the event's own minute and no pair gig is withdrawn; the loop's tick after
+        # the last event sees the settled state.
+        at, self.event_at = self.event_at, None
+        self.flush_pairs(desk, desk.now if at is None else min(at, desk.now), at is None)
         self.flush_chains(desk)
         self.send_targeted_offers(desk)
+        if at is None:
+            self.send_follow_offers(desk)
 
     def next_wake(self, desk) -> int:
         wakes = [when + self.params["bundleWait"] for when in self.bundle_pending.values()]
+        for oid, held_at in self.pair_hold.items():
+            reserved = self.pair_reserved.get(oid)
+            wakes.append(max(held_at + self.params["pairHold"], reserved["until"] + 1 if reserved else 0, desk.now + 1))
+        for row in self.pairs.values():
+            if row["state"] == "posted":
+                wakes.append(desk.now + 1 if row.get("dropped") else max(row["postedAt"] + self.params["pairPostWait"], desk.now + 1))
         for oid in self.open_orders:
             order = desk.orders.get(oid)
             if order and order["status"] == "waiting":
@@ -754,6 +889,15 @@ class PolicyV4:
         """A drop or a no-show: the old fee did not hold a driver, so go up a step now."""
         info = desk.gig_info.get(e["gigId"])
         if not info:
+            return
+        key = next((k for k, row in self.pairs.items() if row["gigId"] == e["gigId"] and row["state"] == "booked"), None)
+        if key:
+            # The round trip did not hold its driver: back to two ordinary single-car gigs, at
+            # the next settled tick (a later event of this step may show it booked again).
+            row = self.pairs[key]
+            self.pair_stats["dropped"] += 1
+            self.pair_stats["feeSavingCents"] -= row["savingCents"] or 0
+            row.update({"state": "posted", "dropped": True})
             return
         items = desk.fee_items(desk.posts.get(e["gigId"], {}).get("stops", []))
         if not items or any(order["id"] in desk.urgent for order, _ in items):
@@ -780,8 +924,19 @@ class PolicyV4:
         steps = [{"at": desk.now, "feeCents": round_half_up(ref * f0)}]
         t1 = max(desk.now + 1, order["lastPickupAt"] - p["f1Lead"])
         t2 = max(t1 + 1, order["lastPickupAt"] - p["f2Lead"])
-        steps.append({"at": t1, "feeCents": round_half_up(ref * max(f0, p["f1"]))})
-        steps.append({"at": t2, "feeCents": round_half_up(ref * max(f0, p["f2"]))})
+        rises = [(t1, p["f1"]), (t2, p["f2"])]
+        due = order["lastPickupAt"] // DAY * DAY
+        if p["fEve"] and due > desk.now // DAY * DAY:
+            rises.append((max(desk.now + 90, due - DAY + p["eveAt"]), p["fEve"]))
+        if p["fMorn"] and due + p["mornAt"] > desk.now + 90:
+            rises.append((due + p["mornAt"], p["fMorn"]))
+        mult, last = f0, desk.now
+        for at, m in sorted(rises):
+            if at >= order["lastPickupAt"]:
+                continue
+            at, mult = max(at, last + 1), max(mult, m)   # times strictly rise, fees never fall
+            steps.append({"at": at, "feeCents": round_half_up(ref * mult)})
+            last = at
         return steps
 
     def fees_bundle(self, desk, items: list, urgent: bool) -> list:
@@ -790,6 +945,9 @@ class PolicyV4:
             order, legs = items[0]
             return self.fees(desk, order, len(legs), urgent)
         p = self.params
+        key = self.pair_of.get(items[0][0]["id"])
+        if len(items) == 2 and key and key == self.pair_of.get(items[1][0]["id"]):
+            return self.pair_fees(desk, items, self.pairs[key], urgent)
         refs = [desk.requests[order["id"]]["referenceFeeCents"] * len(legs) / len(order["legs"])
                 for order, legs in items]
         total = sum(refs)
@@ -806,3 +964,368 @@ class PolicyV4:
         return [{"at": desk.now, "feeCents": round_half_up(opening)},
                 {"at": t1, "feeCents": round_half_up(max(opening, discounted_ref * p["f1"]))},
                 {"at": t2, "feeCents": round_half_up(max(opening, discounted_ref * p["f2"]))}]
+
+    # ------------------------------------------------------------ return-leg pairs (A->B with B->A)
+    def single_opening(self, desk, order: dict) -> float:
+        """The opening fee ``fees`` gives this one-car order posted alone."""
+        p = self.params
+        pf = self.p_fail(order["legs"][0]["pickup"]["placeId"], False)
+        return desk.requests[order["id"]]["referenceFeeCents"] * (p["f0"] + p["f0Risk"] * pf)
+
+    def pair_fees(self, desk, items: list, row: dict, urgent: bool) -> list:
+        """Round-trip fee: pairFee x the two typical fees, at the two-gig level before the warning."""
+        p = self.params
+        total = sum(desk.requests[order["id"]]["referenceFeeCents"] for order, _ in items)
+        if urgent:
+            return steep(desk.now, total, 8)
+        single = sum(self.single_opening(desk, order) for order, _ in items)
+        opening = min(p["pairFee"] * total, single)
+        # The pair's own last start can be earlier than either order's lastPickupAt, so both
+        # rises come before the earliest warning (3 hours before lastPickupAt).
+        last = min([row["latest"]] + [order["lastPickupAt"] for order, _ in items])
+        t1 = max(desk.now + 1, last - p["f1Lead"])
+        t2 = max(t1 + 1, last - p["f2Lead"])
+        return [{"at": desk.now, "feeCents": round_half_up(opening)},
+                {"at": t1, "feeCents": round_half_up(max(opening, single))},
+                {"at": t2, "feeCents": round_half_up(max(opening, single, total * p["f1"]))}]
+
+    def pair_ordinary(self, req: Optional[dict], legs: list, at: int, until: int) -> bool:
+        """Only a plain dealer-to-dealer car is paired.
+
+        A private address, a premium car (experienced drivers only), a low battery (charging
+        stop), a manual gearbox, missing plates, summer tyres, any time the note states, and snow
+        forecast at either end all keep the car in the existing single-gig path, where those
+        constraints are already handled.
+        """
+        if not req or len(legs) != 1:
+            return False
+        leg = legs[0]
+        car = leg["car"]
+        if leg["pickup"]["privateAddress"] or leg["delivery"]["privateAddress"] or car["premium"]:
+            return False
+        if car["electric"] and car.get("chargePercent") is not None and car["chargePercent"] < 30:
+            return False
+        f = self.note_of(req)
+        if f["manual"] or f["plates"] or f["summer"]:
+            return False
+        if any(f[k] is not None for k in ("ready_at", "release_at", "deadline_at", "pickup_open", "pickup_close", "delivery_close")):
+            return False
+        places = {leg["pickup"]["placeId"], leg["delivery"]["placeId"]}
+        return not any(places.intersection(w["places"]) and w["from"] < until and at < w["to"] for w in self.snow)
+
+    def order_job(self, desk, order: dict) -> dict:
+        leg = order["legs"][0]
+        return job(order["id"], leg, leg["pickup"]["window"]["from"], order["lastPickupAt"],
+                   desk.requests[order["id"]]["referenceFeeCents"])
+
+    def plan(self, a: dict, b: dict, at: int, extra_lead: int = 0):
+        p = self.params
+        return plan_pair(a, b, at, p["pairKm"], p["pairMinLead"] + extra_lead, p["pairMaxWait"])
+
+    @staticmethod
+    def has_post(desk, order_id: str) -> bool:
+        return any(a["type"] == "post" and any(s["orderId"] == order_id for s in a["stops"]) for a in desk.outbox)
+
+    def held_orders(self, desk, for_request: Optional[str] = None):
+        """Held orders that are still unposted and not promised to another open quote."""
+        for oid in list(self.pair_hold):
+            order = desk.orders.get(oid)
+            reserved = self.pair_reserved.get(oid)
+            if reserved and reserved["requestId"] != for_request and reserved["until"] >= desk.now:
+                continue
+            if order and not desk.gigs_of(oid) and not self.has_post(desk, oid) and order["deliveredAt"][0] is None:
+                yield order
+
+    def queue_for_pair(self, desk, order: dict) -> bool:
+        """On a win: pair the order with a held return leg, or hold it for one.  False = post as usual."""
+        p, oid = self.params, order["id"]
+        quoted = self.pair_quoted.pop(oid, None)
+        if quoted:
+            self.pair_stats["quoteWins"] += 1
+            alone = quoted["alone"].get(order["option"])
+            if alone is None:
+                self.pair_stats["quoteWinsOtherwiseDeclined"] += 1
+            else:
+                self.pair_stats["quoteDiscountCents"] += alone - order["priceCents"]
+        req = desk.requests.get(oid)
+        if not self.pair_ordinary(req, order["legs"], desk.now, order["deadline"]):
+            return False
+        mine = self.order_job(desk, order)
+        best = None
+        for other in self.held_orders(desk, oid):
+            theirs = self.order_job(desk, other)
+            if not is_return_leg(mine, theirs, p["pairKm"]):
+                continue
+            self.pair_stats["candidates"] += 1
+            plan, reason = self.plan(mine, theirs, desk.now)
+            if not plan:
+                self.pair_stats["rejects"][reason] += 1
+                continue
+            self.pair_stats["feasible"] += 1
+            if best is None or plan["latest"] > best[0]["latest"]:
+                best = (plan, other)
+        if best and self.post_pair(desk, order, best[1], best[0], bool(quoted and quoted["partner"] == best[1]["id"])):
+            return True
+        if best or order["lastPickupAt"] - desk.now < p["pairMinLead"] + p["pairHold"]:
+            return False        # a failed pair post, or too little lead to wait: post it now
+        self.pair_hold[oid] = desk.now
+        self.pair_stats["held"] += 1
+        return True
+
+    def post_pair(self, desk, a: dict, b: dict, plan: dict, via_quote: bool) -> bool:
+        """Post the round trip as one gig through Desk.post_bundle; False leaves both orders as they were."""
+        first, second = (a, b) if plan["first"] == a["id"] else (b, a)
+        key = first["id"] + "|" + second["id"]
+        total = sum(desk.requests[o["id"]]["referenceFeeCents"] for o in (first, second))
+        self.pairs[key] = {
+            "orders": [first["id"], second["id"]], "postedAt": desk.now, "latest": plan["latest"],
+            "driveMinutes": plan["driveMinutes"], "viaQuote": via_quote, "typicalFeeCents": total,
+            "singleFeeCents": round_half_up(sum(self.single_opening(desk, o) for o in (first, second))),
+            "state": "posted", "gigId": None, "bookedAt": None, "feeCents": None, "savingCents": None,
+            "endedAt": None, "reason": None, "onTime": {},
+        }
+        self.pair_of[first["id"]] = self.pair_of[second["id"]] = key
+        try:
+            posted = desk.post_bundle([(first, [0]), (second, [0])])
+        except Exception:
+            posted = False
+        if not posted:
+            del self.pairs[key]
+            self.pair_of.pop(first["id"], None)
+            self.pair_of.pop(second["id"], None)
+            self.pair_stats["postFailed"] += 1
+            return False
+        for o in (first, second):
+            self.pair_hold.pop(o["id"], None)
+            self.pair_reserved.pop(o["id"], None)
+        self.pair_stats["posted"] += 1
+        return True
+
+    def end_pair(self, key: str, at: int, reason: str) -> None:
+        """The pair is over as a pair: its cars are, or are about to be, ordinary single gigs."""
+        row = self.pairs[key]
+        row.update({"state": "dissolved", "endedAt": at, "reason": reason})
+        self.pair_stats["dissolved"] += 1
+        for oid in row["orders"]:
+            if self.pair_of.get(oid) == key:
+                del self.pair_of[oid]
+            if oid in self.pending:
+                self.pending[oid] = at      # the town's booking record starts at the single post
+
+    def dissolve_pair(self, desk, key: str, reason: str, at: int, withdraw: bool = True) -> None:
+        """Back to the individual gigs, with the usual single-car fees.
+
+        ``withdraw`` takes the open pair gig out of the app first.  Without it the pair gig is
+        already gone (refused, expired or changed), and only a car left without a gig is posted.
+        """
+        row = self.pairs[key]
+        if row["gigId"] in desk.booked:
+            return
+        self.end_pair(key, at, reason)
+        orders = [desk.orders[oid] for oid in row["orders"] if oid in desk.orders]
+        try:
+            for order in orders:
+                if withdraw and row["gigId"] in desk.gigs_of(order["id"]):
+                    desk.withdraw(order["id"])     # also reposts the other car of the gig
+                    break
+        finally:
+            for order in orders:
+                if order["deliveredAt"][0] is None and not desk.gigs_of(order["id"]) and not self.has_post(desk, order["id"]):
+                    desk.post(order, [0])
+
+    def release_hold(self, desk, order_id: str, at: int) -> None:
+        self.pair_hold.pop(order_id, None)
+        self.pair_reserved.pop(order_id, None)
+        order = desk.orders.get(order_id)
+        if not order or desk.gigs_of(order_id) or self.has_post(desk, order_id) or order["deliveredAt"][0] is not None:
+            return
+        if order_id in self.pending:
+            self.pending[order_id] = at
+        self.pair_stats["holdReleased"] += 1
+        desk.post(order, [0])
+
+    def flush_pairs(self, desk, now: int, settled: bool = True) -> None:
+        """Release holds that ran out, confirm posted pairs, and dissolve pairs nobody booked.
+
+        ``settled`` is False while later events of the same step are still unhandled.
+        """
+        p = self.params
+        for oid, reserved in list(self.pair_reserved.items()):
+            if reserved["until"] < now:
+                del self.pair_reserved[oid]
+        for oid, held_at in list(self.pair_hold.items()):
+            order = desk.orders.get(oid)
+            reserved = self.pair_reserved.get(oid)
+            waiting_for_quote = bool(reserved and reserved["until"] >= now)
+            if (not order or (now - held_at >= p["pairHold"] and not waiting_for_quote)
+                    or order["lastPickupAt"] - now < p["pairMinLead"]):
+                self.release_hold(desk, oid, now)
+        for key, row in list(self.pairs.items()):
+            if row["state"] != "posted":
+                continue
+            gigs = [desk.leg_gigs.get(oid, {}).get(0) for oid in row["orders"]]
+            if row["gigId"] is None:
+                if gigs[0] and gigs[0] == gigs[1]:
+                    row["gigId"] = gigs[0]
+                elif all(self.has_post(desk, oid) for oid in row["orders"]):
+                    continue                              # the post has not been sent yet
+                else:
+                    # The world refused the pair and Desk already fell back to single gigs.
+                    self.dissolve_pair(desk, key, "refused", now, withdraw=False)
+                    continue
+            elif gigs[0] != row["gigId"] or gigs[1] != row["gigId"]:
+                self.dissolve_pair(desk, key, "changed", now, withdraw=False)
+                continue
+            if settled and row["gigId"] not in desk.booked and (
+                    row.get("dropped") or now - row["postedAt"] >= p["pairPostWait"]
+                    or row["latest"] - now < p["pairMinLead"] - p["pairPostWait"]):
+                self.dissolve_pair(desk, key, "dropped" if row.get("dropped") else "unbooked", now)
+
+    def pair_event(self, desk, e: dict) -> None:
+        """Keep holds, promises and pair rows in step with the world's events."""
+        kind = e["kind"]
+        if kind == "order_lost":
+            self.pair_quoted.pop(e["requestId"], None)
+            for oid, reserved in list(self.pair_reserved.items()):
+                if reserved["requestId"] == e["requestId"]:
+                    del self.pair_reserved[oid]
+        elif kind in ("order_changed", "order_cancelled"):
+            oid = e["order"]["id"] if kind == "order_changed" else e["orderId"]
+            # Desk posts a changed order itself, and reposts the other car of an open gig.
+            self.pair_hold.pop(oid, None)
+            self.pair_reserved.pop(oid, None)
+            key = self.pair_of.get(oid)
+            if key and self.pairs[key]["state"] == "posted":
+                self.end_pair(key, e["at"], "changed" if kind == "order_changed" else "cancelled")
+        elif kind == "gig_expired":
+            key = next((k for k, row in self.pairs.items() if row["gigId"] == e["gigId"] and row["state"] == "posted"), None)
+            if key:
+                self.end_pair(key, e["at"], "expired")      # Desk.repost splits it into single gigs
+        elif kind == "gig_booked":
+            info = desk.gig_info.get(e["gigId"]) or {}
+            ids = info.get("orderIds") or []
+            key = self.pair_of.get(ids[0]) if len(ids) == 2 else None
+            row = self.pairs.get(key) if key and key == self.pair_of.get(ids[1]) else None
+            if row and row["state"] == "posted":
+                schedule = desk.posts[e["gigId"]]["schedule"]
+                fee = max((s["feeCents"] for s in schedule if s["at"] <= e["at"]), default=schedule[0]["feeCents"])
+                row.update({"state": "booked", "gigId": e["gigId"], "bookedAt": e["at"], "feeCents": fee,
+                            "savingCents": row["singleFeeCents"] - fee})
+                self.pair_stats["booked"] += 1
+                self.pair_stats["feeSavingCents"] += row["savingCents"]
+
+    def pair_quote(self, desk, req: dict, ok_opts: list, f0: float) -> Optional[dict]:
+        """Marginal fee cost of a request that completes a held return leg, else None.
+
+        The pair must be postable at the response deadline whichever eligible option the dealer
+        takes, with half an hour of lead beyond what posting needs; the held order is then
+        promised to this request until the dealer decides.  The cost is the pair fee less what
+        the held car would have cost alone, floored at pairMinMarginal x the typical fee, and
+        weighted with the standalone fee for the pairs that find no driver.
+        """
+        p = self.params
+        if not (p["enableReturnPairs"] and p["pairQuote"] and self.pair_hold and desk is not None):
+            return None
+        at, leg, ref = req["respondBy"], req["legs"][0], req["referenceFeeCents"]
+        if not self.pair_ordinary(req, req["legs"], at, max(o["deadline"] for o in ok_opts)):
+            return None
+        drive = road(leg["pickup"]["placeId"], leg["delivery"]["placeId"])["minutes"]
+        jobs = [job(req["id"], leg, max(at, leg["pickup"]["window"]["from"]),
+                    eff_deadline(req, o["deadline"]) - drive - 30, ref) for o in ok_opts]
+        best = None
+        for other in self.held_orders(desk, req["id"]):
+            theirs = self.order_job(desk, other)
+            if not is_return_leg(jobs[0], theirs, p["pairKm"]):
+                continue
+            self.pair_stats["quoteCandidates"] += 1
+            plans = [self.plan(mine, theirs, at, 30)[0] for mine in jobs]
+            if not all(plans):
+                continue
+            self.pair_stats["quoteFeasible"] += 1
+            latest = min(plan["latest"] for plan in plans)
+            if best is None or latest > best[0]:
+                best = (latest, other)
+        if not best:
+            return None
+        other = best[1]
+        other_ref = desk.requests[other["id"]]["referenceFeeCents"]
+        marginal = max(p["pairFee"] * (other_ref + ref) - self.single_opening(desk, other), p["pairMinMarginal"] * ref)
+        fee_cost = p["pairBookProb"] * marginal + (1 - p["pairBookProb"]) * f0 * ref
+        return {"partner": other["id"], "feeCost": fee_cost} if fee_cost < f0 * ref else None
+
+    # ------------------------------------------------------------ follow-on offers to our own drivers
+    def follow_event(self, desk, e: dict) -> None:
+        kind = e["kind"]
+        if kind == "gig_booked":
+            stops = (desk.posts.get(e["gigId"]) or {}).get("stops") or []
+            places = [desk.orders[s["orderId"]]["legs"][s["leg"]][s["kind"]]["placeId"] for s in stops if s["orderId"] in desk.orders]
+            if places and e.get("driverId"):
+                self.driver_jobs[e["gigId"]] = {"driver": e["driverId"], "first": places[0], "last": places[-1]}
+        elif kind in ("gig_dropped", "no_show"):
+            self.driver_jobs.pop(e["gigId"], None)
+            if e["gigId"] in self.follow_won:
+                self.follow_won.discard(e["gigId"])
+                self.follow_stats["droppedAfter"] += 1
+        elif kind == "offer_answered":
+            sent = self.follow_open.get(e["gigId"] + "|" + e["driverId"])
+            if sent and "answer" not in sent:
+                sent["answer"] = e["answer"]
+                self.follow_stats[e["answer"]] = self.follow_stats.get(e["answer"], 0) + 1
+                if e["answer"] == "accepted":
+                    self.follow_stats["savingCents"] += sent["appFee"] - sent["fee"]
+                    self.follow_won.add(e["gigId"])
+
+    def send_follow_offers(self, desk) -> None:
+        """Offer each open single car, below its app fee, to drivers whose booked gig of ours meets it."""
+        p = self.params
+        if not p["enableFollowOffers"] or desk.now == self.follow_last or not self.driver_jobs:
+            return
+        if not 7 * 60 <= desk.now % DAY < 22 * 60 + 45:      # no driver reads an offer at night
+            return
+        self.follow_last = desk.now
+        for gig_id, held in list(self.driver_jobs.items()):
+            stops = (desk.posts.get(gig_id) or {}).get("stops") or []
+            if gig_id not in desk.booked or all(
+                    s["orderId"] not in desk.orders or desk.orders[s["orderId"]]["deliveredAt"][s["leg"]] is not None
+                    for s in stops if s["kind"] == "delivery"):
+                del self.driver_jobs[gig_id]
+        day = desk.now // DAY
+        for oid in self.open_orders:
+            order = desk.orders.get(oid)
+            if not order or order["status"] != "waiting" or len(order["legs"]) != 1 or oid in desk.urgent or oid in self.pair_of:
+                continue
+            gigs = desk.gigs_of(oid)
+            if len(gigs) != 1 or gigs[0] in desk.booked:
+                continue
+            gig_id = gigs[0]
+            post, info = desk.posts.get(gig_id), desk.gig_info.get(gig_id)
+            if not post or not info or info.get("cars") != 1:
+                continue
+            app_fee = self.current_fee(desk, gig_id)
+            fee = round_half_up(p["followMult"] * desk.requests[oid]["referenceFeeCents"])
+            room = 3 - len(self.offered.get(gig_id, {}))
+            if fee >= app_fee or room <= 0:
+                continue
+            pickup, delivery = order["legs"][0]["pickup"]["placeId"], order["legs"][0]["delivery"]["placeId"]
+            candidates = {}
+            for held in self.driver_jobs.values():
+                driver_id = held["driver"]
+                key = gig_id + "|" + driver_id
+                if key in self.follow_open or self.driver_offers.get(driver_id, {}).get(str(day), 0) >= 3:
+                    continue
+                if not self.can_take_gig(driver_id, post["audience"]):
+                    continue
+                after = hav(P[held["last"]], P[pickup]) <= p["followKm"]       # this car continues their trip
+                before = hav(P[delivery], P[held["first"]]) <= p["followKm"]   # this car brings them to it
+                if after or before:
+                    rank = (0 if after and before else 1, driver_id)
+                    if driver_id not in candidates or rank < candidates[driver_id][0]:
+                        candidates[driver_id] = (rank, held["last"])
+            for driver_id, (_, where) in sorted(candidates.items(), key=lambda item: item[1][0])[:room]:
+                desk.outbox.append({"type": "offer", "gigId": gig_id, "driverId": driver_id, "feeCents": fee})
+                row_id = self.record_offer_row(desk, gig_id, info, driver_id, where, pickup, app_fee, fee)
+                self.offered.setdefault(gig_id, {})[driver_id] = {"day": day, "rowId": row_id}
+                usage = self.driver_offers.setdefault(driver_id, {})
+                usage[str(day)] = usage.get(str(day), 0) + 1
+                self.follow_open[gig_id + "|" + driver_id] = {"fee": fee, "appFee": app_fee}
+                self.follow_stats["sent"] += 1
